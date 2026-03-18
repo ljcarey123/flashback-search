@@ -1,3 +1,4 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { Photo, SearchResult } from "../types";
 
 interface Props {
@@ -33,27 +34,31 @@ export function PhotoGrid({ items, onSelect, isSearchResults = false }: Props) {
   }
 
   return (
-    <div className="columns-2 sm:columns-3 lg:columns-4 xl:columns-5 gap-1.5 space-y-1.5">
+    <div
+      className="grid gap-1.5"
+      style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
+    >
       {items.map((item) => {
         const photo = isSearchResult(item) ? item.photo : item;
         const score = isSearchResult(item) ? item.score : null;
+        const thumbSrc = photo.thumb_path ? convertFileSrc(photo.thumb_path) : null;
 
         return (
           <div
             key={photo.id}
             onClick={() => onSelect(photo)}
-            className="break-inside-avoid relative group cursor-pointer rounded-lg overflow-hidden
+            className="relative group cursor-pointer rounded-lg overflow-hidden aspect-square
                        bg-zinc-900 hover:ring-2 hover:ring-violet-500 transition-all"
           >
-            {photo.base_url ? (
+            {thumbSrc ? (
               <img
-                src={`${photo.base_url}=w400-h400-c`}
+                src={thumbSrc}
                 alt={photo.filename}
                 loading="lazy"
-                className="w-full object-cover group-hover:scale-105 transition-transform duration-300"
+                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
               />
             ) : (
-              <div className="w-full aspect-square bg-zinc-800 flex items-center justify-center">
+              <div className="w-full h-full flex items-center justify-center">
                 <span className="text-zinc-600 text-xs">{photo.filename}</span>
               </div>
             )}

@@ -1,24 +1,22 @@
 # Flashback
 
-A Windows desktop app that builds a local, searchable index of your Google Photos library using multimodal AI embeddings.
+A Windows desktop app that builds a private, searchable index of your photo library using multimodal AI embeddings.
 
-Search your memories with natural language — *"me at the beach"*, *"birthday cake 2023"* — and get visually relevant results in under 100ms.
+Search your memories with natural language — *"me at the beach"*, *"birthday cake 2023"* — and get visually relevant results in under 100ms. Everything runs locally; your photos never leave your machine.
 
 ---
 
 ## Current Status
 
-> **Stage 1 — in progress (unverified with real credentials)**
-
-All code through Stage 5 has been written. The immediate next step is connecting real Google Cloud credentials and verifying the OAuth + photo sync flow end-to-end.
+> **Stage 2 — Vector Engine (complete)**
 
 | Stage | Status |
 |---|---|
-| Stage 1 — Cloud Handshake | Code complete. **Needs real-credential verification.** |
-| Stage 2 — Vector Engine | Code complete. Blocked on Stage 1. |
+| Stage 1 — Import & Auth | Complete. |
+| Stage 2 — Vector Engine | Complete. Embedding, AI descriptions, and re-indexing all working. |
 | Stage 3 — People Engine | Planned. DB schema stubbed. No code yet. |
-| Stage 4 — Semantic Search | Code complete. Blocked on Stage 2. |
-| Stage 5 — Save Layer | Code complete. Blocked on Stage 1. |
+| Stage 4 — Semantic Search | Code complete. Functional. |
+| Stage 5 — Save Layer | Code complete. |
 
 ---
 
@@ -29,32 +27,45 @@ All code through Stage 5 has been written. The immediate next step is connecting
 | Frontend | React 19 + TypeScript + Tailwind CSS v4 |
 | Desktop shell | Tauri 2.0 (Rust) |
 | Database | SQLite via rusqlite (bundled, no native extensions) |
-| AI / Embeddings | Gemini Embedding (`gemini-embedding-exp-03-07`) |
-| Cloud source | Google Photos API (read-only OAuth 2.0) |
+| AI / Embeddings | Gemini Embedding (`gemini-embedding-2-preview`, 1536 dims) |
+| AI / Descriptions | Gemini Flash (`gemini-2.5-flash`) |
+| Photo import | Google Takeout (bulk) + Google Photos Picker API (incremental) |
 | Secret storage | Windows Credential Manager via `keyring` crate |
 
 ---
 
 ## Project Stages
 
-### Stage 1 — Cloud Handshake *(code complete, unverified)*
-OAuth 2.0 desktop flow (OOB) to get read access to Google Photos. List and sync photo metadata into a local SQLite database.
+### Stage 1 — Import & Auth *(complete)*
 
-See [docs/google-photos-integration.md](docs/google-photos-integration.md) for a full breakdown of auth, sync, deduplication, base URL expiry, and daily limits.
+Two import paths, both feeding the same local SQLite database:
 
-### Stage 2 — Vector Engine *(code complete, unverified)*
-Download thumbnails → embed with Gemini → store float32 vectors in SQLite. Incremental batch indexing (20 photos per batch) with progress tracking. Videos are skipped.
+- **Google Takeout** — bulk import from an exported archive folder. No auth required. Reads JSON sidecars for original timestamps and titles. Generates 512px JPEG thumbnails locally via the `image` crate.
+- **Google Photos Picker API** — incremental import. User selects photos in a browser Picker UI. Downloads thumbnail + full-resolution original. OAuth via a localhost redirect server (no OOB flow).
+
+Deduplication uses a `{unix_timestamp}_{filename}` fingerprint with a UNIQUE index in SQLite. Re-running either import is safe. Cross-source dedup (Takeout vs Picker for the same photo) is best-effort — see [docs/architecture-decisions.md](docs/architecture-decisions.md).
+
+### Stage 2 — Vector Engine *(complete)*
+
+Incremental batch indexing (20 photos per batch), with concurrent AI description and embedding generation per photo:
+
+1. Read thumbnail from disk
+2. Call `gemini-2.5-flash` with image bytes → AI description → stored in `photos.description`
+3. Call `gemini-embedding-2-preview` with image bytes → 1536-dim float32 vector → stored in `embeddings` table
+
+Both API calls run concurrently via `tokio::join!`. A **Re-index All** button clears the index and restarts. Videos are skipped. Only photos with a local thumbnail are eligible.
 
 ### Stage 3 — People Engine *(planned)*
-Pick a "hero photo" of a person, crop their face, generate a face embedding, and use it to filter the grid.
 
-### Stage 4 — Semantic Search *(code complete, unverified)*
-Embed a text query with Gemini and run cosine-similarity search against the indexed library in pure Rust. Target: results in <100ms.
+Pick a "hero photo" of a person → crop face → generate face embedding → use as an anchor for filtered search. This is face-similarity search, not semantic search — see [docs/architecture-decisions.md](docs/architecture-decisions.md) for why.
 
-### Stage 5 — Save Layer *(code complete, unverified)*
-Download full-resolution originals from Google and write them to `Pictures\Flashback`.
+### Stage 4 — Semantic Search *(code complete)*
 
-> **Videos** are displayed (metadata + thumbnail) but not indexed. Embedding is photos-only for the MVP.
+Embed a text query with `gemini-embedding-2-preview` and run cosine-similarity search against the indexed library in pure Rust. Both query and stored vectors use the same model and dimension, so similarity scores are meaningful across sources. Target: results in <100ms.
+
+### Stage 5 — Save Layer *(code complete)*
+
+Download full-resolution originals from the Picker import to `Pictures\Flashback`. Takeout originals are referenced in-place from their original folder.
 
 ---
 
@@ -75,23 +86,23 @@ npm run tauri dev
 
 ### You'll need
 
-1. **Google Cloud credentials** — create an OAuth 2.0 "Desktop app" client in [Google Cloud Console](https://console.cloud.google.com/). Enable the **Google Photos Library API**. Required scopes:
-   - `https://www.googleapis.com/auth/photoslibrary.readonly`
+1. **Google Cloud credentials** — create an OAuth 2.0 "Desktop app" client in [Google Cloud Console](https://console.cloud.google.com/). Enable the **Google Photos Picker API**. Required scope:
+   - `https://www.googleapis.com/auth/photospicker.mediaitems.readonly`
    - `https://www.googleapis.com/auth/userinfo.profile`
 
-2. **Gemini API key** — get one from [Google AI Studio](https://aistudio.google.com/). Model: `gemini-embedding-exp-03-07` (free tier available, ~1,500 RPM).
+2. **Gemini API key** — get one from [Google AI Studio](https://aistudio.google.com/). Models used: `gemini-embedding-2-preview` and `gemini-2.0-flash` (free tier available).
 
 Enter both in the **Settings** page. Keys are stored in the **Windows Credential Manager** — never written to disk in plaintext.
 
 ### Verifying the DB initialised
 
-Open Settings. The Index Health panel shows the SQLite file path (e.g. `C:\Users\...\AppData\Roaming\com.linus.flashback\flashback.db`) and counts. If it shows `0 Total items`, the migration ran cleanly and the app is ready to sync.
+Open Settings. The Index Health panel shows the SQLite file path and counts. If it shows `0 Total items` the migration ran cleanly and the app is ready to import.
 
 ---
 
 ## Testing
 
-### Frontend — 42 tests
+### Frontend — 43 tests, Rust — 39 tests
 
 ```bash
 npm test               # run once
@@ -99,9 +110,9 @@ npm run test:watch     # watch mode
 npm run test:coverage  # with coverage report
 ```
 
-Uses **Vitest** + **React Testing Library**. Tauri's `invoke` and `listen` are mocked — no binary required.
+Uses **Vitest** + **React Testing Library**. Tauri's `invoke`, `listen`, and `plugin-dialog` are mocked — no binary required.
 
-### Rust — 29 tests
+### Rust — 39 tests
 
 ```bash
 npm run rust:test
@@ -109,7 +120,7 @@ npm run rust:test
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Uses in-memory SQLite (via `rusqlite`) and `mockito` for HTTP responses. Two keychain integration tests are marked `#[ignore]` and must be run explicitly:
+Uses in-memory SQLite (via `rusqlite`) and `mockito` for HTTP responses. Two keychain integration tests are marked `#[ignore]`:
 
 ```bash
 cargo test -- --ignored
@@ -117,7 +128,7 @@ cargo test -- --ignored
 
 ### E2E
 
-Planned post-Stage 1 verification. Will use `tauri-driver` + Playwright once the OAuth flow is proven with real credentials.
+Planned post-Stage 2. Will use `tauri-driver` + Playwright.
 
 ---
 
@@ -149,7 +160,8 @@ npm run tauri build    # Production .exe
 ```
 flashback-search/
 ├── docs/
-│   └── google-photos-integration.md  # Auth, sync, dedup, rate limits
+│   ├── architecture-decisions.md     # Key design decisions and trade-offs
+│   └── google-photos-integration.md  # Auth, Picker API, rate limits
 ├── src/                              # React frontend
 │   ├── components/
 │   │   ├── Inspector.tsx             # Side panel: metadata + download
@@ -158,7 +170,7 @@ flashback-search/
 │   │   ├── PhotoGrid.test.tsx
 │   │   ├── SearchBar.tsx             # Spotlight-style search input
 │   │   ├── SearchBar.test.tsx
-│   │   ├── SettingsPage.tsx          # OAuth, sync, indexing controls
+│   │   ├── SettingsPage.tsx          # Import, auth, indexing controls
 │   │   └── SettingsPage.test.tsx
 │   ├── test/
 │   │   ├── factories.ts              # Test data builders
@@ -172,8 +184,9 @@ flashback-search/
     └── src/
         ├── commands.rs               # Tauri command handlers (all invoke entrypoints)
         ├── db.rs                     # SQLite schema, queries, cosine similarity
-        ├── gemini.rs                 # Gemini Embedding API client
-        ├── google.rs                 # Google OAuth + Photos API client
+        ├── gemini.rs                 # Gemini Embedding + Vision API client
+        ├── google.rs                 # Google OAuth + Picker API client
+        ├── takeout.rs                # Google Takeout folder scanner
         ├── secrets.rs                # Windows Credential Manager wrapper
         └── lib.rs                    # App setup + plugin registration
 ```

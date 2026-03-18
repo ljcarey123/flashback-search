@@ -8,10 +8,13 @@ export function makePhoto(overrides: Partial<Photo> = {}): Photo {
     created_at: "2024-06-15T12:00:00Z",
     width: 4032,
     height: 3024,
-    base_url: "https://lh3.googleusercontent.com/fake",
+    base_url: null,
     mime_type: "image/jpeg",
     is_video: false,
     indexed: false,
+    local_path: "/photos/IMG_001.jpg",
+    fingerprint: "1718452800_IMG_001.jpg",
+    thumb_path: "/app-data/thumbnails/photo-1.jpg",
     ...overrides,
   };
 }

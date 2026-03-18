@@ -1,13 +1,19 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use serde::{Serialize, Deserialize};
-
-use crate::db::Photo;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 // ── OAuth helpers ─────────────────────────────────────────────────────────────
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// Scopes required for the Google Photos Picker API.
+const PICKER_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+    "https://www.googleapis.com/auth/userinfo.profile",
+];
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -16,24 +22,50 @@ pub struct OAuthTokens {
     pub expires_in: Option<i64>,
 }
 
-/// Build the URL the user opens in their browser to start OAuth.
+/// Build the consent URL the user opens in their browser.
 pub fn auth_url(client_id: &str, redirect_uri: &str) -> String {
-    let scopes = [
-        "https://www.googleapis.com/auth/photoslibrary.readonly",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
-    .join(" ");
+    let scopes = PICKER_SCOPES.join(" ");
     format!(
-        "{AUTH_URL}?client_id={client_id}&redirect_uri={redirect_uri}\
-         &response_type=code&scope={scopes}&access_type=offline&prompt=consent",
-        scopes = urlencoding(scopes)
+        "{AUTH_URL}?client_id={client_id}&redirect_uri={redirect}&\
+         response_type=code&scope={scope}&access_type=offline&prompt=consent",
+        redirect = url_encode(redirect_uri),
+        scope = url_encode(&scopes),
     )
 }
 
-fn urlencoding(s: String) -> String {
-    s.replace(' ', "%20")
-        .replace(':', "%3A")
-        .replace('/', "%2F")
+fn url_encode(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            ' ' => vec!['%', '2', '0'],
+            ':' => vec!['%', '3', 'A'],
+            '/' => vec!['%', '2', 'F'],
+            _ => vec![c],
+        })
+        .collect()
+}
+
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Exchange an auth code for access + refresh tokens.
@@ -60,7 +92,7 @@ pub async fn exchange_code(
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Refresh an expired access token (planned for token auto-refresh).
+/// Refresh an expired access token.
 #[allow(dead_code)]
 pub async fn refresh_token(
     client: &Client,
@@ -83,111 +115,55 @@ pub async fn refresh_token(
     Ok(serde_json::from_str(&body)?)
 }
 
-// ── Photos API ────────────────────────────────────────────────────────────────
+// ── Localhost OAuth redirect server ──────────────────────────────────────────
 
-const PHOTOS_API: &str = "https://photoslibrary.googleapis.com/v1";
+/// Start a one-shot TCP server on a random port that catches the OAuth redirect.
+///
+/// Returns `(port, receiver)`.  The receiver resolves with the auth `code`
+/// once Google redirects the browser to `http://127.0.0.1:{port}/?code=...`.
+pub async fn start_oauth_server() -> Result<(u16, tokio::sync::oneshot::Receiver<String>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
 
-#[derive(Deserialize)]
-struct ListResponse {
-    #[serde(rename = "mediaItems", default)]
-    media_items: Vec<MediaItem>,
-    #[serde(rename = "nextPageToken")]
-    next_page_token: Option<String>,
-}
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
 
-#[derive(Deserialize)]
-struct MediaItem {
-    id: String,
-    filename: String,
-    description: Option<String>,
-    #[serde(rename = "mimeType")]
-    mime_type: Option<String>,
-    #[serde(rename = "baseUrl")]
-    base_url: Option<String>,
-    #[serde(rename = "mediaMetadata")]
-    media_metadata: Option<MediaMetadata>,
-}
+            // Send a friendly success page back to the browser
+            let html = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/html; charset=utf-8\r\n\r\n",
+                "<!doctype html><html><body style='font-family:sans-serif;padding:2em'>",
+                "<h2>✓ Flashback sign-in complete</h2>",
+                "<p>You can close this tab and return to the app.</p>",
+                "</body></html>",
+            );
+            let _ = stream.write_all(html.as_bytes()).await;
 
-#[derive(Deserialize)]
-struct MediaMetadata {
-    #[serde(rename = "creationTime")]
-    creation_time: Option<String>,
-    width: Option<serde_json::Value>,
-    height: Option<serde_json::Value>,
-}
-
-/// Fetch one page of media items (max 100).  Returns (photos, next_page_token).
-pub async fn list_media_page(
-    client: &Client,
-    access_token: &str,
-    page_token: Option<&str>,
-) -> Result<(Vec<Photo>, Option<String>)> {
-    let mut url = format!("{PHOTOS_API}/mediaItems?pageSize=100");
-    if let Some(pt) = page_token {
-        url.push_str(&format!("&pageToken={pt}"));
-    }
-    let resp = client
-        .get(&url)
-        .bearer_auth(access_token)
-        .send()
-        .await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-    if !status.is_success() {
-        return Err(anyhow!("Photos list failed ({status}): {body}"));
-    }
-    let parsed: ListResponse = serde_json::from_str(&body)?;
-
-    let photos: Vec<Photo> = parsed
-        .media_items
-        .into_iter()
-        .map(|item| {
-            let (w, h, created_at) = item.media_metadata.map_or((None, None, None), |m| {
-                let w = m.width.and_then(|v| v.as_str().map(|s| s.parse().ok()).unwrap_or(v.as_i64()));
-                let h = m.height.and_then(|v| v.as_str().map(|s| s.parse().ok()).unwrap_or(v.as_i64()));
-                (w, h, m.creation_time)
-            });
-            let is_video = item
-                .mime_type
-                .as_deref()
-                .map(|m| m.starts_with("video/"))
-                .unwrap_or(false);
-            Photo {
-                id: item.id,
-                filename: item.filename,
-                description: item.description,
-                created_at,
-                width: w,
-                height: h,
-                base_url: item.base_url,
-                mime_type: item.mime_type,
-                is_video,
-                indexed: false,
+            if let Some(code) = parse_oauth_code(&request) {
+                let _ = tx.send(code);
             }
-        })
-        .collect();
+        }
+    });
 
-    Ok((photos, parsed.next_page_token))
+    Ok((port, rx))
 }
 
-/// Download thumbnail bytes (w=512 crop).
-pub async fn download_thumbnail(client: &Client, base_url: &str) -> Result<Vec<u8>> {
-    let url = format!("{base_url}=w512-h512-c");
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("Thumbnail download failed: {}", resp.status()));
+/// Extract `code` from the first line of an HTTP/1.1 GET request.
+/// e.g. `GET /?code=4%2F0AX...&scope=... HTTP/1.1`
+fn parse_oauth_code(request: &str) -> Option<String> {
+    let first_line = request.lines().next()?;
+    let path = first_line.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("code=") {
+            return Some(url_decode(val));
+        }
     }
-    Ok(resp.bytes().await?.to_vec())
-}
-
-/// Download full-resolution original.
-pub async fn download_original(client: &Client, base_url: &str) -> Result<Vec<u8>> {
-    let url = format!("{base_url}=d");
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("Original download failed: {}", resp.status()));
-    }
-    Ok(resp.bytes().await?.to_vec())
+    None
 }
 
 // ── User profile ──────────────────────────────────────────────────────────────
@@ -212,116 +188,292 @@ pub async fn get_user_profile(client: &Client, access_token: &str) -> Result<Use
     Ok(serde_json::from_str(&body)?)
 }
 
+// ── Google Photos Picker API ──────────────────────────────────────────────────
+
+const PICKER_API: &str = "https://photospicker.googleapis.com/v1";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PickerSession {
+    pub id: String,
+    pub picker_uri: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PickerMediaItem {
+    pub id: String,
+    pub create_time: Option<String>,
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// Short-lived (~60 min) CDN base URL.  Append `=w512-h512-c` for a 512px thumbnail.
+    pub base_url: String,
+    pub is_video: bool,
+}
+
+// ── Picker API deserialization types ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SessionResponse {
+    id: String,
+    #[serde(rename = "pickerUri")]
+    picker_uri: String,
+}
+
+#[derive(Deserialize)]
+struct SessionPollResponse {
+    #[serde(rename = "mediaItemsSet", default)]
+    media_items_set: bool,
+}
+
+#[derive(Deserialize)]
+struct MediaItemsResponse {
+    #[serde(rename = "mediaItems", default)]
+    media_items: Vec<RawMediaItem>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawMediaItem {
+    id: String,
+    #[serde(rename = "createTime")]
+    create_time: Option<String>,
+    #[serde(rename = "type")]
+    item_type: Option<String>,
+    #[serde(rename = "mediaFile")]
+    media_file: Option<RawMediaFile>,
+}
+
+#[derive(Deserialize)]
+struct RawMediaFile {
+    #[serde(rename = "baseUrl")]
+    base_url: Option<String>,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    filename: Option<String>,
+    #[serde(rename = "mediaFileMetadata")]
+    metadata: Option<RawMediaFileMetadata>,
+}
+
+#[derive(Deserialize)]
+struct RawMediaFileMetadata {
+    width: Option<serde_json::Value>,
+    height: Option<serde_json::Value>,
+}
+
+fn parse_dim(v: Option<&serde_json::Value>) -> Option<i64> {
+    v.and_then(|x| x.as_i64().or_else(|| x.as_str()?.parse().ok()))
+}
+
+// ── Picker API functions ──────────────────────────────────────────────────────
+
+/// Create a new Picker session.  Returns the session id and the URL to open in
+/// the browser so the user can select photos.
+pub async fn create_picker_session(client: &Client, access_token: &str) -> Result<PickerSession> {
+    let resp = client
+        .post(format!("{PICKER_API}/sessions"))
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!("create_picker_session failed ({status}): {body}"));
+    }
+    let parsed: SessionResponse = serde_json::from_str(&body)?;
+    Ok(PickerSession {
+        id: parsed.id,
+        picker_uri: parsed.picker_uri,
+    })
+}
+
+/// Poll a Picker session.  Returns `true` once the user has finished
+/// selecting photos (`mediaItemsSet = true`).
+pub async fn poll_picker_session(
+    client: &Client,
+    access_token: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let resp = client
+        .get(format!("{PICKER_API}/sessions/{session_id}"))
+        .bearer_auth(access_token)
+        .send()
+        .await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!("poll_picker_session failed ({status}): {body}"));
+    }
+    let parsed: SessionPollResponse = serde_json::from_str(&body)?;
+    Ok(parsed.media_items_set)
+}
+
+/// Retrieve all media items selected in the given session (handles pagination).
+pub async fn list_picker_items(
+    client: &Client,
+    access_token: &str,
+    session_id: &str,
+) -> Result<Vec<PickerMediaItem>> {
+    let mut all = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut url = format!(
+            "{PICKER_API}/mediaItems?sessionId={session_id}&pageSize=100"
+        );
+        if let Some(ref pt) = page_token {
+            url.push_str(&format!("&pageToken={pt}"));
+        }
+
+        let resp = client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!("list_picker_items failed ({status}): {body}"));
+        }
+
+        let parsed: MediaItemsResponse = serde_json::from_str(&body)?;
+        let next = parsed.next_page_token.clone();
+
+        for item in parsed.media_items {
+            if let Some(mf) = item.media_file {
+                let base_url = match mf.base_url {
+                    Some(u) => u,
+                    None => continue,
+                };
+                let (w, h) = mf
+                    .metadata
+                    .as_ref()
+                    .map(|m| (parse_dim(m.width.as_ref()), parse_dim(m.height.as_ref())))
+                    .unwrap_or((None, None));
+
+                let is_video = item
+                    .item_type
+                    .as_deref()
+                    .map(|t| t == "VIDEO")
+                    .unwrap_or_else(|| {
+                        mf.mime_type
+                            .as_deref()
+                            .map(|m| m.starts_with("video/"))
+                            .unwrap_or(false)
+                    });
+
+                all.push(PickerMediaItem {
+                    id: item.id,
+                    create_time: item.create_time,
+                    filename: mf.filename.unwrap_or_else(|| "photo.jpg".to_string()),
+                    mime_type: mf.mime_type,
+                    width: w,
+                    height: h,
+                    base_url,
+                    is_video,
+                });
+            }
+        }
+
+        if next.is_none() {
+            break;
+        }
+        page_token = next;
+    }
+
+    Ok(all)
+}
+
+/// Delete a Picker session (cleanup — best-effort, errors are ignored).
+pub async fn delete_picker_session(
+    client: &Client,
+    access_token: &str,
+    session_id: &str,
+) -> Result<()> {
+    client
+        .delete(format!("{PICKER_API}/sessions/{session_id}"))
+        .bearer_auth(access_token)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Download raw bytes from a URL with an Authorization: Bearer token.
+pub async fn download_bytes(client: &Client, url: &str, token: &str) -> Result<Vec<u8>> {
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("Download failed: {}", resp.status()));
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
+// ── Convert Picker createTime to unix timestamp ────────────────────────────────
+
+/// Parse an ISO 8601 string (e.g. "2024-01-01T00:00:00Z") to a unix timestamp string.
+pub fn iso_to_unix(iso: &str) -> Option<String> {
+    iso.parse::<chrono::DateTime<chrono::Utc>>()
+        .ok()
+        .map(|dt| dt.timestamp().to_string())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::Server;
-    use serde_json::json;
-
-    // ── auth_url ──────────────────────────────────────────────────────────────
 
     #[test]
     fn auth_url_contains_client_id() {
-        let url = auth_url("my-client-id", "urn:ietf:wg:oauth:2.0:oob");
-        assert!(url.contains("my-client-id"), "URL should include the client_id");
+        let url = auth_url("my-client-id", "http://127.0.0.1:12345");
+        assert!(url.contains("my-client-id"));
     }
 
     #[test]
-    fn auth_url_contains_required_scopes() {
-        let url = auth_url("id", "urn:ietf:wg:oauth:2.0:oob");
-        assert!(url.contains("photoslibrary.readonly"));
-        assert!(url.contains("userinfo.profile"));
+    fn auth_url_contains_picker_scope() {
+        let url = auth_url("id", "http://127.0.0.1:1");
+        assert!(url.contains("photospicker.mediaitems.readonly"));
     }
 
     #[test]
     fn auth_url_requests_offline_access() {
-        let url = auth_url("id", "urn:ietf:wg:oauth:2.0:oob");
+        let url = auth_url("id", "http://127.0.0.1:1");
         assert!(url.contains("access_type=offline"));
     }
 
-    // ── list_media_page ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn list_media_page_parses_photos_and_next_token() {
-        let mut server = Server::new_async().await;
-        let body = json!({
-            "mediaItems": [
-                {
-                    "id": "photo1",
-                    "filename": "IMG_001.jpg",
-                    "mimeType": "image/jpeg",
-                    "baseUrl": "https://lh3.example.com/photo1",
-                    "mediaMetadata": {
-                        "creationTime": "2024-01-01T00:00:00Z",
-                        "width": "1920",
-                        "height": "1080"
-                    }
-                }
-            ],
-            "nextPageToken": "token_abc"
-        });
-
-        let mock = server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(body.to_string())
-            .create_async()
-            .await;
-
-        // Call against a modified URL that points at the mock server
-        let client = Client::new();
-        let url = format!("{}/v1/mediaItems?pageSize=100", server.url());
-        let resp = client.get(&url).bearer_auth("fake_token").send().await.unwrap();
-        let parsed: serde_json::Value = resp.json().await.unwrap();
-
-        assert_eq!(parsed["mediaItems"][0]["id"], "photo1");
-        assert_eq!(parsed["nextPageToken"], "token_abc");
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn list_media_page_handles_empty_response() {
-        let mut server = Server::new_async().await;
-        server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(json!({ "mediaItems": [] }).to_string())
-            .create_async()
-            .await;
-
-        let client = Client::new();
-        let url = format!("{}/v1/mediaItems?pageSize=100", server.url());
-        let resp = client.get(&url).bearer_auth("tok").send().await.unwrap();
-        let parsed: serde_json::Value = resp.json().await.unwrap();
-
-        assert!(parsed["mediaItems"].as_array().unwrap().is_empty());
+    #[test]
+    fn parse_oauth_code_extracts_code() {
+        let request = "GET /?code=4%2F0ABC123&scope=openid HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+        let code = parse_oauth_code(request).unwrap();
+        assert_eq!(code, "4/0ABC123");
     }
 
     #[test]
-    fn video_mime_type_detected() {
-        // Verify the is_video detection logic by constructing a Photo directly
-        let is_video = "video/mp4".starts_with("video/");
-        assert!(is_video);
-        let is_not_video = "image/jpeg".starts_with("video/");
-        assert!(!is_not_video);
-    }
-
-    // ── thumbnail URL format ──────────────────────────────────────────────────
-
-    #[test]
-    fn thumbnail_url_appends_size_suffix() {
-        let base = "https://lh3.googleusercontent.com/abc";
-        let expected = format!("{base}=w512-h512-c");
-        assert_eq!(format!("{base}=w512-h512-c"), expected);
+    fn parse_oauth_code_returns_none_without_code() {
+        let request = "GET /?error=access_denied HTTP/1.1\r\n";
+        assert!(parse_oauth_code(request).is_none());
     }
 
     #[test]
-    fn original_url_appends_download_suffix() {
-        let base = "https://lh3.googleusercontent.com/abc";
-        assert!(format!("{base}=d").ends_with("=d"));
+    fn url_decode_handles_percent_encoding() {
+        assert_eq!(url_decode("hello%20world"), "hello world");
+        assert_eq!(url_decode("4%2F0AX"), "4/0AX");
+        assert_eq!(url_decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn iso_to_unix_parses_rfc3339() {
+        let ts = iso_to_unix("2021-01-01T00:00:00Z").unwrap();
+        assert_eq!(ts, "1609459200");
+    }
+
+    #[test]
+    fn iso_to_unix_returns_none_for_invalid() {
+        assert!(iso_to_unix("not-a-date").is_none());
     }
 }

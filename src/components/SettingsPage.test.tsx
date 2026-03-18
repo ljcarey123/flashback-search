@@ -2,10 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { SettingsPage } from "./SettingsPage";
 import { makeAuthStatus, makeStats } from "../test/factories";
 
 const mockInvoke = vi.mocked(invoke);
+const mockOpenDialog = vi.mocked(openDialog);
 
 function defaultInvokes() {
   mockInvoke.mockImplementation((cmd: string) => {
@@ -22,6 +24,7 @@ describe("SettingsPage", () => {
 
   beforeEach(() => {
     mockInvoke.mockReset();
+    mockOpenDialog.mockReset();
     onAuthChange.mockClear();
     defaultInvokes();
   });
@@ -45,7 +48,40 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("shows 'signed in' UI when authenticated", async () => {
+  it("shows Sync Center with Import Archive button", async () => {
+    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
+    await waitFor(() => {
+      expect(screen.getByText("Sync Center")).toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: /Choose Takeout Folder/i })).toBeInTheDocument();
+  });
+
+  it("shows sign-in form when not authenticated", async () => {
+    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("OAuth 2.0 Client ID")).toBeInTheDocument();
+    });
+    expect(screen.getByPlaceholderText("Client Secret")).toBeInTheDocument();
+  });
+
+  it("disables sign-in button when credentials are empty", async () => {
+    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Sign in with Google" })).toBeDisabled();
+    });
+  });
+
+  it("enables sign-in button once both credential fields are filled", async () => {
+    const user = userEvent.setup();
+    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
+
+    await user.type(await screen.findByPlaceholderText("OAuth 2.0 Client ID"), "my-client-id");
+    await user.type(screen.getByPlaceholderText("Client Secret"), "my-secret");
+
+    expect(screen.getByRole("button", { name: "Sign in with Google" })).toBeEnabled();
+  });
+
+  it("shows 'Add Recent Memories' button when authenticated", async () => {
     render(
       <SettingsPage
         authStatus={makeAuthStatus({ authenticated: true, user_name: "Ada Lovelace" })}
@@ -55,33 +91,8 @@ describe("SettingsPage", () => {
     await waitFor(() => {
       expect(screen.getByText(/Ada Lovelace/)).toBeInTheDocument();
     });
-    expect(screen.getByRole("button", { name: "Sync Library" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Add Recent Memories/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
-  });
-
-  it("shows OAuth form when not authenticated", async () => {
-    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
-    await waitFor(() => {
-      expect(screen.getByPlaceholderText("Client ID")).toBeInTheDocument();
-    });
-    expect(screen.getByPlaceholderText("Client Secret")).toBeInTheDocument();
-  });
-
-  it("disables 'Open Google Sign-In' when credentials are empty", async () => {
-    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Open Google Sign-In" })).toBeDisabled();
-    });
-  });
-
-  it("enables 'Open Google Sign-In' once both fields are filled", async () => {
-    const user = userEvent.setup();
-    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
-
-    await user.type(await screen.findByPlaceholderText("Client ID"), "my-client-id");
-    await user.type(screen.getByPlaceholderText("Client Secret"), "my-secret");
-
-    expect(screen.getByRole("button", { name: "Open Google Sign-In" })).toBeEnabled();
   });
 
   it("shows key-saved indicator when Gemini key is present in keychain", async () => {
@@ -120,28 +131,25 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("shows sync error when sync_library fails", async () => {
+  it("calls import_takeout when a folder is selected via Import Archive", async () => {
+    mockOpenDialog.mockResolvedValue("/Users/linus/Downloads/Takeout");
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "load_settings")
         return Promise.resolve({ has_gemini_key: false, client_id: null });
       if (cmd === "get_stats")
         return Promise.resolve(makeStats({ total: 0, photos: 0, indexed: 0, videos: 0 }));
       if (cmd === "get_db_path") return Promise.resolve("C:\\AppData\\flashback.db");
-      if (cmd === "sync_library") return Promise.reject("Network error");
+      if (cmd === "import_takeout") return Promise.resolve({ added: 42, skipped: 3, errors: 0 });
       return Promise.resolve(null);
     });
-    const user = userEvent.setup();
-    render(
-      <SettingsPage
-        authStatus={makeAuthStatus({ authenticated: true, user_name: "Ada" })}
-        onAuthChange={onAuthChange}
-      />,
-    );
 
-    await user.click(await screen.findByRole("button", { name: "Sync Library" }));
+    const user = userEvent.setup();
+    render(<SettingsPage authStatus={makeAuthStatus()} onAuthChange={onAuthChange} />);
+
+    await user.click(await screen.findByRole("button", { name: /Choose Takeout Folder/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/Network error/)).toBeInTheDocument();
+      expect(screen.getByText(/42 added/)).toBeInTheDocument();
     });
   });
 });

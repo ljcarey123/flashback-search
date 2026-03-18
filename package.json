@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
@@ -48,6 +49,6 @@
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.57.1",
     "vite": "^7.0.4",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.0"
   }
 }

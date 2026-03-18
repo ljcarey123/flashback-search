@@ -135,7 +135,7 @@ export default function App() {
 
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
-        <main className="flex-1 overflow-y-auto">
+        <main className="flex-1 min-w-0 overflow-y-auto">
           {view === "settings" ? (
             <SettingsPage
               authStatus={authStatus}
@@ -145,7 +145,7 @@ export default function App() {
               }}
             />
           ) : (
-            <div className="p-4">
+            <div className="max-w-5xl mx-auto p-6">
               {/* View header */}
               {view === "search" && searchResults !== null && (
                 <div className="flex items-center justify-between mb-4">
@@ -187,10 +187,8 @@ export default function App() {
           )}
         </main>
 
-        {/* Inspector panel */}
-        {selectedPhoto && (
-          <Inspector photo={selectedPhoto} onClose={() => setSelectedPhoto(null)} />
-        )}
+        {/* Inspector panel — always present to avoid layout shifts */}
+        <Inspector photo={selectedPhoto} onClose={() => setSelectedPhoto(null)} />
       </div>
     </div>
   );
