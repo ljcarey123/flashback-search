@@ -1,16 +1,65 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Photo } from "../types";
+
+const MIN_WIDTH = 280;
+const MAX_WIDTH_FRACTION = 0.62; // max 62% of viewport
 
 interface Props {
   photo: Photo | null;
   onClose: () => void;
+  onZoom?: (photo: Photo) => void;
 }
 
-export function Inspector({ photo, onClose }: Props) {
+export function Inspector({ photo, onClose, onZoom }: Props) {
   const [downloading, setDownloading] = useState(false);
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [panelWidth, setPanelWidth] = useState(420);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Reset per-photo state when selection changes
+  useEffect(() => {
+    setSavedPath(null);
+    setError(null);
+  }, [photo?.id]);
+
+  // Cursor override while dragging
+  useEffect(() => {
+    if (isDragging) {
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    } else {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+    return () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [isDragging]);
+
+  const handleResizeMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = panelWidth;
+    setIsDragging(true);
+
+    const onMouseMove = (ev: MouseEvent) => {
+      const delta = startX - ev.clientX; // dragging left expands the panel
+      const maxWidth = Math.floor(window.innerWidth * MAX_WIDTH_FRACTION);
+      setPanelWidth(Math.max(MIN_WIDTH, Math.min(startWidth + delta, maxWidth)));
+    };
+
+    const onMouseUp = () => {
+      setIsDragging(false);
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  };
 
   const download = async () => {
     if (!photo) return;
@@ -38,13 +87,25 @@ export function Inspector({ photo, onClose }: Props) {
 
   return (
     <aside
-      className={`shrink-0 overflow-hidden transition-[width] duration-200 ease-in-out ${photo ? "w-1/2" : "w-0"}`}
+      style={{ width: photo ? panelWidth : 0 }}
+      className={`shrink-0 overflow-hidden ${isDragging ? "" : "transition-[width] duration-200 ease-in-out"}`}
     >
-      <div className="w-[50vw] h-full bg-zinc-900 border-l border-zinc-800 flex flex-col overflow-hidden">
+      <div
+        style={{ width: panelWidth }}
+        className="h-full bg-zinc-900 border-l border-zinc-800 flex flex-col overflow-hidden relative"
+      >
+        {/* Resize handle */}
+        <div
+          onMouseDown={handleResizeMouseDown}
+          className="absolute left-0 top-0 bottom-0 w-[5px] cursor-col-resize z-10
+                     hover:bg-violet-500/40 active:bg-violet-500/60 transition-colors"
+          title="Drag to resize"
+        />
+
         {photo ? (
           <>
             {/* Header */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 shrink-0">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 shrink-0 pl-5">
               <span className="text-sm font-medium text-zinc-300">Inspector</span>
               <button
                 onClick={onClose}
@@ -62,19 +123,22 @@ export function Inspector({ photo, onClose }: Props) {
               </button>
             </div>
 
-            {/* Photo preview — fills all available vertical space */}
+            {/* Photo preview */}
             <div className="flex-1 min-h-0 bg-zinc-950 flex items-center justify-center overflow-hidden relative">
               {previewSrc ? (
                 <img
                   src={previewSrc}
                   alt={photo.filename}
-                  className="max-w-full max-h-full object-contain"
+                  onClick={() => !photo.is_video && onZoom?.(photo)}
+                  className={`max-w-full max-h-full object-contain transition-transform duration-200
+                    ${!photo.is_video && onZoom ? "cursor-zoom-in hover:scale-[1.03]" : ""}`}
                 />
               ) : (
                 <span className="text-zinc-600 text-xs">No preview</span>
               )}
+
               {photo.is_video && (
-                <div className="absolute inset-0 flex items-center justify-center">
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                   <div className="w-12 h-12 bg-black/60 rounded-full flex items-center justify-center">
                     <svg
                       className="w-6 h-6 text-white ml-1"
@@ -84,6 +148,15 @@ export function Inspector({ photo, onClose }: Props) {
                       <path d="M6.3 2.841A1.5 1.5 0 0 0 4 4.11V15.89a1.5 1.5 0 0 0 2.3 1.269l9.344-5.89a1.5 1.5 0 0 0 0-2.538L6.3 2.84Z" />
                     </svg>
                   </div>
+                </div>
+              )}
+
+              {/* Zoom hint */}
+              {previewSrc && !photo.is_video && onZoom && (
+                <div className="absolute bottom-2 right-2 opacity-0 hover:opacity-100 transition-opacity pointer-events-none">
+                  <span className="text-[10px] text-zinc-500 bg-black/60 rounded px-1.5 py-0.5">
+                    click to expand
+                  </span>
                 </div>
               )}
             </div>

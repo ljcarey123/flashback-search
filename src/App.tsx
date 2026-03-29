@@ -6,6 +6,7 @@ import "./main.css";
 import { SearchBar } from "./components/SearchBar";
 import { PhotoGrid } from "./components/PhotoGrid";
 import { Inspector } from "./components/Inspector";
+import { Lightbox } from "./components/Lightbox";
 import { SettingsPage } from "./components/SettingsPage";
 import { AppView, AuthStatus, Photo, SearchResult, Stats } from "./types";
 
@@ -20,6 +21,7 @@ export default function App() {
   });
   const [stats, setStats] = useState<Stats | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  const [zoomedPhoto, setZoomedPhoto] = useState<Photo | null>(null);
 
   // Bootstrap
   useEffect(() => {
@@ -188,8 +190,15 @@ export default function App() {
         </main>
 
         {/* Inspector panel — always present to avoid layout shifts */}
-        <Inspector photo={selectedPhoto} onClose={() => setSelectedPhoto(null)} />
+        <Inspector
+          photo={selectedPhoto}
+          onClose={() => setSelectedPhoto(null)}
+          onZoom={setZoomedPhoto}
+        />
       </div>
+
+      {/* Lightbox */}
+      {zoomedPhoto && <Lightbox photo={zoomedPhoto} onClose={() => setZoomedPhoto(null)} />}
     </div>
   );
 }
