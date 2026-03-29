@@ -38,24 +38,29 @@ export function PhotoGrid({ items, onSelect, isSearchResults = false }: Props) {
       className="grid gap-1.5"
       style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}
     >
-      {items.map((item) => {
+      {items.map((item, index) => {
         const photo = isSearchResult(item) ? item.photo : item;
         const score = isSearchResult(item) ? item.score : null;
         const thumbSrc = photo.thumb_path ? convertFileSrc(photo.thumb_path) : null;
+        // Stagger entrance for first 40 items; rest appear instantly
+        const animDelay = index < 40 ? index * 28 : 0;
 
         return (
           <div
             key={photo.id}
             onClick={() => onSelect(photo)}
+            style={{ animationDelay: `${animDelay}ms` }}
             className="relative group cursor-pointer rounded-lg overflow-hidden aspect-square
-                       bg-zinc-900 hover:ring-2 hover:ring-violet-500 transition-all"
+                       bg-zinc-900 animate-photo-in
+                       hover:ring-2 hover:ring-violet-500/80 hover:shadow-lg hover:shadow-violet-900/30
+                       transition-[box-shadow,outline]"
           >
             {thumbSrc ? (
               <img
                 src={thumbSrc}
                 alt={photo.filename}
                 loading="lazy"
-                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                className="w-full h-full object-cover group-hover:scale-[1.07] transition-transform duration-500 ease-out"
               />
             ) : (
               <div className="w-full h-full flex items-center justify-center">
@@ -63,9 +68,12 @@ export function PhotoGrid({ items, onSelect, isSearchResults = false }: Props) {
               </div>
             )}
 
+            {/* Subtle gradient vignette on hover */}
+            <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+
             {/* Video badge */}
             {photo.is_video && (
-              <div className="absolute top-2 right-2 bg-black/70 rounded px-1.5 py-0.5 text-xs text-zinc-300 flex items-center gap-1">
+              <div className="absolute top-2 right-2 bg-black/70 backdrop-blur-sm rounded px-1.5 py-0.5 text-xs text-zinc-300 flex items-center gap-1">
                 <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                   <path d="M6.3 2.841A1.5 1.5 0 0 0 4 4.11V15.89a1.5 1.5 0 0 0 2.3 1.269l9.344-5.89a1.5 1.5 0 0 0 0-2.538L6.3 2.84Z" />
                 </svg>
@@ -76,10 +84,10 @@ export function PhotoGrid({ items, onSelect, isSearchResults = false }: Props) {
             {/* Similarity score */}
             {isSearchResults && score !== null && (
               <div
-                className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent
-                              p-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 to-transparent
+                              p-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200"
               >
-                <div className="text-xs text-violet-400 font-mono">
+                <div className="text-xs text-violet-400 font-mono font-semibold">
                   {(score * 100).toFixed(1)}% match
                 </div>
               </div>
