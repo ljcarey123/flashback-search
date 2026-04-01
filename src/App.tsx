@@ -22,6 +22,7 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [zoomedPhoto, setZoomedPhoto] = useState<Photo | null>(null);
+  const [sortOrder, setSortOrder] = useState<"desc" | "asc">("desc");
 
   // Bootstrap
   useEffect(() => {
@@ -79,7 +80,8 @@ export default function App() {
     }
   };
 
-  const displayItems = view === "search" && searchResults ? searchResults : photos;
+  const sortedPhotos = sortOrder === "desc" ? photos : [...photos].reverse();
+  const displayItems = view === "search" && searchResults ? searchResults : sortedPhotos;
 
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-zinc-950">
@@ -169,14 +171,31 @@ export default function App() {
               {view === "library" && (
                 <div className="flex items-center justify-between mb-4">
                   <span className="text-sm text-zinc-400">{photos.length} items</span>
-                  {!authStatus.authenticated && (
+                  <div className="flex items-center gap-3">
                     <button
-                      onClick={() => setView("settings")}
-                      className="text-xs text-violet-400 hover:text-violet-300 transition-colors"
+                      onClick={() => setSortOrder((o) => (o === "desc" ? "asc" : "desc"))}
+                      className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors flex items-center gap-1"
                     >
-                      Connect Google Photos →
+                      {sortOrder === "desc" ? "Newest first" : "Oldest first"}
+                      <svg
+                        className={`w-3 h-3 transition-transform ${sortOrder === "asc" ? "rotate-180" : ""}`}
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth={2}
+                        viewBox="0 0 24 24"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                      </svg>
                     </button>
-                  )}
+                    {!authStatus.authenticated && (
+                      <button
+                        onClick={() => setView("settings")}
+                        className="text-xs text-violet-400 hover:text-violet-300 transition-colors"
+                      >
+                        Connect Google Photos →
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
 

@@ -5,6 +5,9 @@ mod google;
 pub(crate) mod secrets;
 mod takeout;
 
+#[cfg(test)]
+mod tests;
+
 use commands::AppState;
 use std::sync::Mutex;
 use tauri::Manager;
