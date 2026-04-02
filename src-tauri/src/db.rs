@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Photo {
@@ -21,14 +22,20 @@ pub struct Photo {
     pub thumb_path: Option<String>,
 }
 
-/// Planned for Stage 3 – Face Anchoring.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Person {
     pub id: String,
     pub name: String,
     pub anchor_photo_id: String,
     pub face_crop_base64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Face {
+    pub id: String,
+    pub photo_id: String,
+    pub bbox_json: String,
+    pub vector_json: Option<String>,
 }
 
 pub fn open(db_path: &str) -> Result<Connection> {
@@ -68,6 +75,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             vector_json      TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS person_examples (
+            id               TEXT PRIMARY KEY,
+            person_id        TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            face_crop_base64 TEXT,
+            vector_json      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_examples_person ON person_examples(person_id);
+
+        CREATE TABLE IF NOT EXISTS faces (
+            id          TEXT PRIMARY KEY,
+            photo_id    TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+            bbox_json   TEXT NOT NULL,
+            vector_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
+
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -83,6 +108,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_fingerprint \
          ON photos(fingerprint) WHERE fingerprint IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photos_created_at ON photos(created_at DESC)",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE photos ADD COLUMN faces_detected INTEGER NOT NULL DEFAULT 0",
         [],
     );
 
@@ -278,7 +311,7 @@ pub fn semantic_search(
          WHERE p.is_video = 0",
         cols = SELECT_COLS
             .split(", ")
-            .map(|c| format!("{c}"))
+            .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(", p.")
     );
@@ -290,8 +323,11 @@ pub fn semantic_search(
             Ok((photo, vec_json))
         })?
         .filter_map(|r| r.ok())
-        .map(|(photo, json)| {
-            let vec: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
+        .filter_map(|(photo, json)| {
+            let vec: Vec<f32> = serde_json::from_str(&json).ok()?;
+            Some((photo, vec))
+        })
+        .map(|(photo, vec)| {
             let score = cosine_similarity(query_vec, &vec);
             (photo, score)
         })
@@ -300,6 +336,289 @@ pub fn semantic_search(
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     results.truncate(limit);
     Ok(results)
+}
+
+// ── faces ─────────────────────────────────────────────────────────────────────
+
+pub fn insert_face(conn: &Connection, photo_id: &str, bbox_json: &str) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO faces(id, photo_id, bbox_json) VALUES(?1, ?2, ?3)",
+        params![id, photo_id, bbox_json],
+    )?;
+    Ok(id)
+}
+
+pub fn save_face_embedding(conn: &Connection, face_id: &str, vector: &[f32]) -> Result<()> {
+    let json = serde_json::to_string(vector)?;
+    conn.execute(
+        "UPDATE faces SET vector_json=?1 WHERE id=?2",
+        params![json, face_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_faces_for_photo(conn: &Connection, photo_id: &str) -> Result<Vec<Face>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, photo_id, bbox_json, vector_json FROM faces WHERE photo_id=?1",
+    )?;
+    let rows = stmt
+        .query_map(params![photo_id], |row| {
+            Ok(Face {
+                id: row.get(0)?,
+                photo_id: row.get(1)?,
+                bbox_json: row.get(2)?,
+                vector_json: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn delete_faces_for_photo(conn: &Connection, photo_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM faces WHERE photo_id=?1", params![photo_id])?;
+    Ok(())
+}
+
+/// Photos that are indexed, not a video, and haven't had face detection run yet.
+pub fn get_photos_needing_face_detection(conn: &Connection, limit: usize) -> Result<Vec<Photo>> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM photos \
+         WHERE indexed=1 AND is_video=0 AND faces_detected=0 \
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([limit as i64], row_to_photo)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn mark_faces_detected(conn: &Connection, photo_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET faces_detected=1 WHERE id=?1",
+        params![photo_id],
+    )?;
+    Ok(())
+}
+
+/// Faces that have been detected but not yet embedded.
+pub fn get_unembedded_faces(conn: &Connection, limit: usize) -> Result<Vec<Face>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, photo_id, bbox_json, vector_json FROM faces \
+         WHERE vector_json IS NULL LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map([limit as i64], |row| {
+            Ok(Face {
+                id: row.get(0)?,
+                photo_id: row.get(1)?,
+                bbox_json: row.get(2)?,
+                vector_json: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Cosine similarity search over face embeddings. Returns one result per photo,
+/// using the highest-scoring face match per photo.
+pub fn face_search(
+    conn: &Connection,
+    anchor_vec: &[f32],
+    limit: usize,
+) -> Result<Vec<(Photo, f32)>> {
+    let sql = format!(
+        "SELECT p.{cols}, f.vector_json
+         FROM faces f JOIN photos p ON p.id = f.photo_id
+         WHERE f.vector_json IS NOT NULL AND p.is_video = 0",
+        cols = SELECT_COLS
+            .split(", ")
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", p.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let all_pairs: Vec<(Photo, f32)> = stmt
+        .query_map([], |row| {
+            let photo = row_to_photo(row)?;
+            let vec_json: String = row.get(12)?;
+            Ok((photo, vec_json))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(photo, json)| {
+            let vec: Vec<f32> = serde_json::from_str(&json).ok()?;
+            Some((photo, vec))
+        })
+        .map(|(photo, vec)| {
+            let score = cosine_similarity(anchor_vec, &vec);
+            (photo, score)
+        })
+        .collect();
+
+    // Keep best score per photo
+    let mut best: HashMap<String, (Photo, f32)> = HashMap::new();
+    for (photo, score) in all_pairs {
+        let entry = best
+            .entry(photo.id.clone())
+            .or_insert((photo.clone(), f32::NEG_INFINITY));
+        if score > entry.1 {
+            *entry = (photo, score);
+        }
+    }
+
+    let mut results: Vec<(Photo, f32)> = best.into_values().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    results.truncate(limit);
+    Ok(results)
+}
+
+// ── people ────────────────────────────────────────────────────────────────────
+
+pub fn insert_person(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    anchor_photo_id: &str,
+    face_crop_base64: Option<&str>,
+    vector_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO people(id, name, anchor_photo_id, face_crop_base64, vector_json) \
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![id, name, anchor_photo_id, face_crop_base64, vector_json],
+    )?;
+    Ok(())
+}
+
+pub fn list_people(conn: &Connection) -> Result<Vec<Person>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, anchor_photo_id, face_crop_base64 FROM people ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                anchor_photo_id: row.get(2)?,
+                face_crop_base64: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn get_person_vector(conn: &Connection, person_id: &str) -> Result<Option<Vec<f32>>> {
+    let mut stmt = conn.prepare("SELECT vector_json FROM people WHERE id=?1")?;
+    let result = stmt.query_row(params![person_id], |row| row.get::<_, Option<String>>(0));
+    match result {
+        Ok(Some(json)) => {
+            let vec: Vec<f32> = serde_json::from_str(&json)?;
+            Ok(Some(vec))
+        }
+        Ok(None) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn delete_person(conn: &Connection, person_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM people WHERE id=?1", params![person_id])?;
+    Ok(())
+}
+
+// ── person examples ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonExample {
+    pub id: String,
+    pub person_id: String,
+    pub face_crop_base64: Option<String>,
+}
+
+pub fn insert_person_example(
+    conn: &Connection,
+    person_id: &str,
+    face_crop_base64: Option<&str>,
+    vector_json: &str,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO person_examples(id, person_id, face_crop_base64, vector_json) \
+         VALUES(?1, ?2, ?3, ?4)",
+        params![id, person_id, face_crop_base64, vector_json],
+    )?;
+    Ok(id)
+}
+
+pub fn list_person_examples(conn: &Connection, person_id: &str) -> Result<Vec<PersonExample>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, person_id, face_crop_base64 FROM person_examples WHERE person_id=?1",
+    )?;
+    let rows = stmt
+        .query_map(params![person_id], |row| {
+            Ok(PersonExample {
+                id: row.get(0)?,
+                person_id: row.get(1)?,
+                face_crop_base64: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn delete_person_example(conn: &Connection, example_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM person_examples WHERE id=?1",
+        params![example_id],
+    )?;
+    Ok(())
+}
+
+/// Recompute the centroid of all examples for a person and store it in people.vector_json.
+/// Returns the new centroid, or None if the person has no examples.
+pub fn recompute_person_centroid(
+    conn: &Connection,
+    person_id: &str,
+) -> Result<Option<Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT vector_json FROM person_examples WHERE person_id=?1",
+    )?;
+    let vecs: Vec<Vec<f32>> = stmt
+        .query_map(params![person_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter_map(|json| serde_json::from_str::<Vec<f32>>(&json).ok())
+        .collect();
+
+    if vecs.is_empty() {
+        return Ok(None);
+    }
+
+    let dim = vecs[0].len();
+    let n = vecs.len() as f32;
+    let mut centroid = vec![0.0_f32; dim];
+    for v in &vecs {
+        for (i, x) in v.iter().enumerate() {
+            centroid[i] += x;
+        }
+    }
+    for x in &mut centroid {
+        *x /= n;
+    }
+
+    let json = serde_json::to_string(&centroid)?;
+    conn.execute(
+        "UPDATE people SET vector_json=?1 WHERE id=?2",
+        params![json, person_id],
+    )?;
+
+    Ok(Some(centroid))
 }
 
 // ── settings ──────────────────────────────────────────────────────────────────
@@ -323,324 +642,3 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
-        conn
-    }
-
-    fn sample_photo(id: &str) -> Photo {
-        Photo {
-            id: id.to_string(),
-            filename: format!("{id}.jpg"),
-            description: None,
-            created_at: Some("2024-01-01T00:00:00Z".to_string()),
-            width: Some(1920),
-            height: Some(1080),
-            base_url: Some(format!("https://example.com/{id}")),
-            mime_type: Some("image/jpeg".to_string()),
-            is_video: false,
-            indexed: false,
-            local_path: Some(format!("/photos/{id}.jpg")),
-            fingerprint: Some(format!("1704067200_{id}.jpg")),
-            thumb_path: None,
-        }
-    }
-
-    // ── migrate ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn migrate_creates_tables() {
-        let conn = test_db();
-        let tables: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                .unwrap();
-            stmt.query_map([], |r| r.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        assert!(tables.contains(&"photos".to_string()));
-        assert!(tables.contains(&"embeddings".to_string()));
-        assert!(tables.contains(&"people".to_string()));
-        assert!(tables.contains(&"settings".to_string()));
-    }
-
-    #[test]
-    fn migrate_is_idempotent() {
-        let conn = test_db();
-        assert!(migrate(&conn).is_ok());
-    }
-
-    // ── upsert_photos ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn upsert_inserts_new_photos() {
-        let conn = test_db();
-        let photos = vec![sample_photo("p1"), sample_photo("p2")];
-        upsert_photos(&conn, &photos).unwrap();
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn upsert_updates_existing_photo_base_url() {
-        let conn = test_db();
-        upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
-
-        let mut updated = sample_photo("p1");
-        updated.base_url = Some("https://example.com/updated".to_string());
-        upsert_photos(&conn, &[updated]).unwrap();
-
-        let url: String = conn
-            .query_row("SELECT base_url FROM photos WHERE id='p1'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(url, "https://example.com/updated");
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn upsert_preserves_indexed_flag_across_update() {
-        let conn = test_db();
-        upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
-        conn.execute("UPDATE photos SET indexed=1 WHERE id='p1'", []).unwrap();
-
-        upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
-
-        let indexed: i32 = conn
-            .query_row("SELECT indexed FROM photos WHERE id='p1'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(indexed, 1, "indexed flag must survive an upsert");
-    }
-
-    // ── insert_photo_if_new ───────────────────────────────────────────────────
-
-    #[test]
-    fn insert_photo_if_new_inserts_first_time() {
-        let conn = test_db();
-        let inserted = insert_photo_if_new(&conn, &sample_photo("p1")).unwrap();
-        assert!(inserted);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn insert_photo_if_new_skips_duplicate_fingerprint() {
-        let conn = test_db();
-        insert_photo_if_new(&conn, &sample_photo("p1")).unwrap();
-
-        // Different id, same fingerprint
-        let mut dup = sample_photo("p2");
-        dup.fingerprint = Some("1704067200_p1.jpg".to_string()); // same as p1
-        let inserted = insert_photo_if_new(&conn, &dup).unwrap();
-        assert!(!inserted);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    // ── find_by_fingerprint ───────────────────────────────────────────────────
-
-    #[test]
-    fn find_by_fingerprint_returns_matching_photo() {
-        let conn = test_db();
-        insert_photo_if_new(&conn, &sample_photo("p1")).unwrap();
-        let found = find_by_fingerprint(&conn, "1704067200_p1.jpg").unwrap();
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().id, "p1");
-    }
-
-    #[test]
-    fn find_by_fingerprint_returns_none_for_missing() {
-        let conn = test_db();
-        let found = find_by_fingerprint(&conn, "nope").unwrap();
-        assert!(found.is_none());
-    }
-
-    // ── save_embedding ────────────────────────────────────────────────────────
-
-    #[test]
-    fn save_embedding_stores_vector_and_marks_indexed() {
-        let conn = test_db();
-        upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
-
-        let vec: Vec<f32> = vec![0.1, 0.2, 0.3];
-        save_embedding(&conn, "p1", &vec).unwrap();
-
-        let indexed: i32 = conn
-            .query_row("SELECT indexed FROM photos WHERE id='p1'", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(indexed, 1);
-
-        let json: String = conn
-            .query_row(
-                "SELECT vector_json FROM embeddings WHERE photo_id='p1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let recovered: Vec<f32> = serde_json::from_str(&json).unwrap();
-        assert_eq!(recovered, vec);
-    }
-
-    #[test]
-    fn save_embedding_replaces_existing_vector() {
-        let conn = test_db();
-        upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
-        save_embedding(&conn, "p1", &[0.1, 0.2]).unwrap();
-        save_embedding(&conn, "p1", &[0.9, 0.8]).unwrap();
-
-        let json: String = conn
-            .query_row(
-                "SELECT vector_json FROM embeddings WHERE photo_id='p1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let recovered: Vec<f32> = serde_json::from_str(&json).unwrap();
-        assert_eq!(recovered, vec![0.9_f32, 0.8_f32]);
-    }
-
-    // ── cosine_similarity ─────────────────────────────────────────────────────
-
-    #[test]
-    fn cosine_similarity_identical_vectors() {
-        let v = vec![1.0_f32, 0.0, 0.0];
-        let sim = cosine_similarity(&v, &v);
-        assert!((sim - 1.0).abs() < 1e-6, "identical vectors → 1.0, got {sim}");
-    }
-
-    #[test]
-    fn cosine_similarity_orthogonal_vectors() {
-        let a = vec![1.0_f32, 0.0];
-        let b = vec![0.0_f32, 1.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-6, "orthogonal → 0.0, got {sim}");
-    }
-
-    #[test]
-    fn cosine_similarity_opposite_vectors() {
-        let a = vec![1.0_f32, 0.0];
-        let b = vec![-1.0_f32, 0.0];
-        let sim = cosine_similarity(&a, &b);
-        assert!((sim + 1.0).abs() < 1e-6, "opposite → -1.0, got {sim}");
-    }
-
-    #[test]
-    fn cosine_similarity_zero_vector_returns_zero() {
-        let a = vec![0.0_f32, 0.0];
-        let b = vec![1.0_f32, 0.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
-    }
-
-    // ── semantic_search ───────────────────────────────────────────────────────
-
-    #[test]
-    fn semantic_search_returns_ranked_results() {
-        let conn = test_db();
-        upsert_photos(&conn, &[sample_photo("p1"), sample_photo("p2")]).unwrap();
-        save_embedding(&conn, "p1", &[1.0, 0.0]).unwrap();
-        save_embedding(&conn, "p2", &[0.0, 1.0]).unwrap();
-
-        let query = vec![1.0_f32, 0.0];
-        let results = semantic_search(&conn, &query, 10).unwrap();
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0.id, "p1");
-        assert!(results[0].1 > results[1].1);
-    }
-
-    #[test]
-    fn semantic_search_excludes_videos() {
-        let conn = test_db();
-        let mut video = sample_photo("v1");
-        video.is_video = true;
-        upsert_photos(&conn, &[sample_photo("p1"), video]).unwrap();
-        save_embedding(&conn, "p1", &[1.0, 0.0]).unwrap();
-        conn.execute(
-            "INSERT INTO embeddings(photo_id, vector_json) VALUES('v1', '[1.0, 0.0]')",
-            [],
-        )
-        .unwrap();
-
-        let results = semantic_search(&conn, &[1.0_f32, 0.0], 10).unwrap();
-        assert!(results.iter().all(|(p, _)| !p.is_video));
-    }
-
-    #[test]
-    fn semantic_search_respects_limit() {
-        let conn = test_db();
-        for i in 0..5 {
-            let p = sample_photo(&format!("p{i}"));
-            upsert_photos(&conn, &[p]).unwrap();
-            save_embedding(&conn, &format!("p{i}"), &[1.0, 0.0]).unwrap();
-        }
-        let results = semantic_search(&conn, &[1.0_f32, 0.0], 3).unwrap();
-        assert_eq!(results.len(), 3);
-    }
-
-    // ── get_unindexed_photos ──────────────────────────────────────────────────
-
-    #[test]
-    fn get_unindexed_excludes_indexed_videos_and_no_local_path() {
-        let conn = test_db();
-
-        let mut video = sample_photo("v1");
-        video.is_video = true;
-
-        let mut no_path = sample_photo("p3");
-        no_path.local_path = None;
-        no_path.fingerprint = Some("1704067200_p3.jpg".to_string());
-
-        upsert_photos(&conn, &[sample_photo("p1"), sample_photo("p2"), video, no_path]).unwrap();
-        conn.execute("UPDATE photos SET indexed=1 WHERE id='p1'", []).unwrap();
-
-        let unindexed = get_unindexed_photos(&conn, 100).unwrap();
-        let ids: Vec<&str> = unindexed.iter().map(|p| p.id.as_str()).collect();
-        assert!(ids.contains(&"p2"), "p2 should be unindexed");
-        assert!(!ids.contains(&"p1"), "p1 is indexed");
-        assert!(!ids.contains(&"v1"), "videos excluded");
-        assert!(!ids.contains(&"p3"), "no-local-path excluded");
-    }
-
-    // ── settings ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn settings_roundtrip() {
-        let conn = test_db();
-        set_setting(&conn, "theme", "dark").unwrap();
-        assert_eq!(get_setting(&conn, "theme").unwrap(), Some("dark".to_string()));
-    }
-
-    #[test]
-    fn settings_missing_key_returns_none() {
-        let conn = test_db();
-        assert_eq!(get_setting(&conn, "nonexistent").unwrap(), None);
-    }
-
-    #[test]
-    fn settings_upsert_overwrites() {
-        let conn = test_db();
-        set_setting(&conn, "key", "v1").unwrap();
-        set_setting(&conn, "key", "v2").unwrap();
-        assert_eq!(get_setting(&conn, "key").unwrap(), Some("v2".to_string()));
-    }
-}

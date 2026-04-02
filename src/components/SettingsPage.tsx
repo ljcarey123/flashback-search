@@ -175,7 +175,7 @@ export function SettingsPage({ authStatus, onAuthChange }: Props) {
     setIndexing(true);
     setError(null);
     try {
-      const count = await invoke<number>("index_next_batch", { batchSize: 20 });
+      const count = await invoke<number>("index_next_batch", { batchSize: 100 });
       setMsg(`Indexed ${count} photos in this batch`);
       await refreshStats();
     } catch (e) {
@@ -190,7 +190,7 @@ export function SettingsPage({ authStatus, onAuthChange }: Props) {
     setError(null);
     try {
       await invoke("reset_index");
-      const count = await invoke<number>("index_next_batch", { batchSize: 20 });
+      const count = await invoke<number>("index_next_batch", { batchSize: 100 });
       setMsg(`Re-indexing started — ${count} photos in first batch`);
       await refreshStats();
     } catch (e) {
@@ -513,7 +513,7 @@ export function SettingsPage({ authStatus, onAuthChange }: Props) {
                 Indexing…
               </>
             ) : (
-              "Index Next Batch (20)"
+              "Index Next Batch (100)"
             )}
           </button>
           <button

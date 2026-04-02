@@ -9,7 +9,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use crate::{db, gemini, google, secrets, takeout};
+use crate::{db, face, gemini, google, secrets, takeout};
+use base64::Engine;
 
 // ── App State ─────────────────────────────────────────────────────────────────
 
@@ -18,6 +19,10 @@ pub struct AppState {
     pub http: Client,
     /// App data directory — used to compute thumbnail and photo storage paths.
     pub data_dir: PathBuf,
+    /// Path to the Ultra-Light face detection ONNX model.
+    pub face_detect_model: PathBuf,
+    /// Path to the MobileFaceNet face embedding ONNX model.
+    pub face_embed_model: PathBuf,
 }
 
 // ── DTOs ──────────────────────────────────────────────────────────────────────
@@ -26,6 +31,13 @@ pub struct AppState {
 pub struct SearchResult {
     pub photo: db::Photo,
     pub score: f32,
+}
+
+#[derive(Serialize)]
+pub struct FaceStats {
+    pub photos_pending_detection: i64,
+    pub faces_detected: i64,
+    pub faces_embedded: i64,
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -773,4 +785,388 @@ pub async fn load_settings(state: State<'_, AppState>) -> Result<serde_json::Val
         "has_gemini_key": has_gemini_key,
         "client_id": client_id,
     }))
+}
+
+// ── Face detection batch ──────────────────────────────────────────────────────
+
+/// Run face detection on a batch of indexed photos that have not yet been processed.
+/// Stores detected bounding boxes in the `faces` table and marks photos as `faces_detected`.
+/// Emits `"face-detect-progress"` events: `{ done, total }`.
+#[tauri::command]
+pub async fn detect_faces_batch(
+    batch_size: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let model = face::load_detection_model(&state.face_detect_model)
+        .map_err(|e| e.to_string())?;
+
+    let photos = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_photos_needing_face_detection(&db, batch_size).map_err(|e| e.to_string())?
+    };
+
+    let total = photos.len();
+    let mut done = 0usize;
+
+    for photo in photos {
+        let thumb = thumb_path(&state.data_dir, &photo.id);
+        let bytes = match std::fs::read(&thumb) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Thumbnail missing for {}: {e}", photo.id);
+                // Mark detected anyway so we don't retry forever
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                let _ = db::mark_faces_detected(&db, &photo.id);
+                done += 1;
+                continue;
+            }
+        };
+
+        let bboxes = match face::detect_faces(&model, &bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Face detection failed for {}: {e}", photo.id);
+                vec![]
+            }
+        };
+
+        {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            // Clear any stale rows then re-insert
+            db::delete_faces_for_photo(&db, &photo.id).map_err(|e| e.to_string())?;
+            for bbox in &bboxes {
+                let bbox_json =
+                    serde_json::to_string(bbox).map_err(|e| e.to_string())?;
+                db::insert_face(&db, &photo.id, &bbox_json).map_err(|e| e.to_string())?;
+            }
+            db::mark_faces_detected(&db, &photo.id).map_err(|e| e.to_string())?;
+        }
+
+        done += 1;
+        app.emit(
+            "face-detect-progress",
+            serde_json::json!({ "done": done, "total": total }),
+        )
+        .ok();
+    }
+
+    Ok(done)
+}
+
+// ── Face embedding batch ──────────────────────────────────────────────────────
+
+/// Embed all detected-but-unembedded face crops using MobileFaceNet.
+/// Emits `"face-embed-progress"` events: `{ done, total }`.
+#[tauri::command]
+pub async fn embed_faces_batch(
+    batch_size: usize,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let model = face::load_embedding_model(&state.face_embed_model)
+        .map_err(|e| e.to_string())?;
+
+    let faces = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_unembedded_faces(&db, batch_size).map_err(|e| e.to_string())?
+    };
+
+    let total = faces.len();
+    let mut done = 0usize;
+
+    for face_row in faces {
+        let thumb = thumb_path(&state.data_dir, &face_row.photo_id);
+        let thumb_bytes = match std::fs::read(&thumb) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Thumbnail missing for face {}: {e}", face_row.id);
+                done += 1;
+                continue;
+            }
+        };
+
+        let bbox: face::FaceBbox = match serde_json::from_str(&face_row.bbox_json) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Bad bbox JSON for face {}: {e}", face_row.id);
+                done += 1;
+                continue;
+            }
+        };
+
+        let crop_bytes = match face::crop_face_bytes(&thumb_bytes, &bbox) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Crop failed for face {}: {e}", face_row.id);
+                done += 1;
+                continue;
+            }
+        };
+
+        let vector = match face::embed_face(&model, &crop_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Embed failed for face {}: {e}", face_row.id);
+                done += 1;
+                continue;
+            }
+        };
+
+        {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db::save_face_embedding(&db, &face_row.id, &vector)
+                .map_err(|e| e.to_string())?;
+        }
+
+        done += 1;
+        app.emit(
+            "face-embed-progress",
+            serde_json::json!({ "done": done, "total": total }),
+        )
+        .ok();
+    }
+
+    Ok(done)
+}
+
+// ── Per-photo face detection (for the People UI) ──────────────────────────────
+
+/// Detect faces in a single photo and return their bounding boxes.
+/// Results are stored in the DB (idempotent — returns cached results if already run).
+#[tauri::command]
+pub async fn detect_faces_for_photo(
+    photo_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<face::FaceBbox>, String> {
+    // Return cached results if detection has already run for this photo
+    let already_detected = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let rows = db::get_faces_for_photo(&db, &photo_id).map_err(|e| e.to_string())?;
+        if !rows.is_empty() {
+            let bboxes: Vec<face::FaceBbox> = rows
+                .into_iter()
+                .filter_map(|r| serde_json::from_str(&r.bbox_json).ok())
+                .collect();
+            return Ok(bboxes);
+        }
+        false
+    };
+    let _ = already_detected; // detection hasn't run yet — fall through
+
+    let thumb = thumb_path(&state.data_dir, &photo_id);
+    let bytes = std::fs::read(&thumb).map_err(|e| format!("Thumbnail not found: {e}"))?;
+
+    let model = face::load_detection_model(&state.face_detect_model)
+        .map_err(|e| e.to_string())?;
+    let bboxes = face::detect_faces(&model, &bytes).map_err(|e| e.to_string())?;
+
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::delete_faces_for_photo(&db, &photo_id).map_err(|e| e.to_string())?;
+        for bbox in &bboxes {
+            let json = serde_json::to_string(bbox).map_err(|e| e.to_string())?;
+            db::insert_face(&db, &photo_id, &json).map_err(|e| e.to_string())?;
+        }
+        db::mark_faces_detected(&db, &photo_id).map_err(|e| e.to_string())?;
+    }
+
+    Ok(bboxes)
+}
+
+// ── People CRUD ───────────────────────────────────────────────────────────────
+
+/// List all saved people, ordered by name.
+#[tauri::command]
+pub async fn list_people(state: State<'_, AppState>) -> Result<Vec<db::Person>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::list_people(&db).map_err(|e| e.to_string())
+}
+
+/// Create a new person from a face in a specific photo.
+/// Crops the face, embeds it, stores it as the first example, and computes the centroid.
+#[tauri::command]
+pub async fn create_person(
+    name: String,
+    photo_id: String,
+    bbox_json: String,
+    state: State<'_, AppState>,
+) -> Result<db::Person, String> {
+    if name.trim().is_empty() || name.len() > 100 {
+        return Err("Name must be between 1 and 100 characters".into());
+    }
+    let thumb = thumb_path(&state.data_dir, &photo_id);
+    let thumb_bytes =
+        std::fs::read(&thumb).map_err(|e| format!("Thumbnail not found: {e}"))?;
+
+    let bbox: face::FaceBbox =
+        serde_json::from_str(&bbox_json).map_err(|e| format!("Invalid bbox: {e}"))?;
+
+    let crop_bytes =
+        face::crop_face_bytes(&thumb_bytes, &bbox).map_err(|e| e.to_string())?;
+
+    let embed_model = face::load_embedding_model(&state.face_embed_model)
+        .map_err(|e| e.to_string())?;
+    let vector = face::embed_face(&embed_model, &crop_bytes).map_err(|e| e.to_string())?;
+
+    let face_crop_b64 = base64::engine::general_purpose::STANDARD.encode(&crop_bytes);
+    let vector_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
+
+    let person_id = uuid::Uuid::new_v4().to_string();
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::insert_person(
+            &db,
+            &person_id,
+            &name,
+            &photo_id,
+            Some(&face_crop_b64),
+            &vector_json,
+        )
+        .map_err(|e| e.to_string())?;
+        db::insert_person_example(&db, &person_id, Some(&face_crop_b64), &vector_json)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(db::Person {
+        id: person_id,
+        name,
+        anchor_photo_id: photo_id,
+        face_crop_base64: Some(face_crop_b64),
+    })
+}
+
+/// Add an additional face example to an existing person.
+/// Recomputes the centroid embedding across all examples.
+#[tauri::command]
+pub async fn add_person_example(
+    person_id: String,
+    photo_id: String,
+    bbox_json: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let thumb = thumb_path(&state.data_dir, &photo_id);
+    let thumb_bytes =
+        std::fs::read(&thumb).map_err(|e| format!("Thumbnail not found: {e}"))?;
+
+    let bbox: face::FaceBbox =
+        serde_json::from_str(&bbox_json).map_err(|e| format!("Invalid bbox: {e}"))?;
+
+    let crop_bytes =
+        face::crop_face_bytes(&thumb_bytes, &bbox).map_err(|e| e.to_string())?;
+
+    let embed_model = face::load_embedding_model(&state.face_embed_model)
+        .map_err(|e| e.to_string())?;
+    let vector = face::embed_face(&embed_model, &crop_bytes).map_err(|e| e.to_string())?;
+
+    let face_crop_b64 = base64::engine::general_purpose::STANDARD.encode(&crop_bytes);
+    let vector_json = serde_json::to_string(&vector).map_err(|e| e.to_string())?;
+
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::insert_person_example(&db, &person_id, Some(&face_crop_b64), &vector_json)
+            .map_err(|e| e.to_string())?;
+        db::recompute_person_centroid(&db, &person_id).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Delete a person and all their examples.
+#[tauri::command]
+pub async fn delete_person(
+    person_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_person(&db, &person_id).map_err(|e| e.to_string())
+}
+
+// ── Person search ─────────────────────────────────────────────────────────────
+
+/// Find photos containing a specific person using face similarity search.
+/// Returns results in the same `SearchResult` format as semantic search so the
+/// existing PhotoGrid can display them without changes.
+#[tauri::command]
+pub async fn search_by_person(
+    person_id: String,
+    limit: usize,
+    min_score: f32,
+    state: State<'_, AppState>,
+) -> Result<Vec<SearchResult>, String> {
+    let anchor_vec = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db::get_person_vector(&db, &person_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Person has no embedding — add at least one face example")?
+    };
+
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let results = db::face_search(&db, &anchor_vec, limit).map_err(|e| e.to_string())?;
+
+    Ok(results
+        .into_iter()
+        .filter(|(_, score)| *score >= min_score)
+        .map(|(photo, score)| {
+            let mut p = photo;
+            p.thumb_path = Some(
+                thumb_path(&state.data_dir, &p.id)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            SearchResult { photo: p, score }
+        })
+        .collect())
+}
+
+// ── Face stats ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_face_stats(state: State<'_, AppState>) -> Result<FaceStats, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let photos_pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE indexed=1 AND is_video=0 AND faces_detected=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let faces_detected: i64 = db
+        .query_row("SELECT COUNT(*) FROM faces", [], |r| r.get(0))
+        .unwrap_or(0);
+    let faces_embedded: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM faces WHERE vector_json IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(FaceStats {
+        photos_pending_detection: photos_pending,
+        faces_detected,
+        faces_embedded,
+    })
+}
+
+/// List all face examples for a person (for the multi-example UI).
+#[tauri::command]
+pub async fn list_person_examples(
+    person_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<db::PersonExample>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::list_person_examples(&db, &person_id).map_err(|e| e.to_string())
+}
+
+/// Delete a single face example from a person, then recompute the centroid.
+#[tauri::command]
+pub async fn delete_person_example(
+    example_id: String,
+    person_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db::delete_person_example(&db, &example_id).map_err(|e| e.to_string())?;
+    db::recompute_person_centroid(&db, &person_id).map_err(|e| e.to_string())?;
+    Ok(())
 }

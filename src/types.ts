@@ -47,4 +47,30 @@ export interface ImportSummary {
   errors: number;
 }
 
-export type AppView = "library" | "search" | "settings";
+export interface FaceBbox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface Person {
+  id: string;
+  name: string;
+  anchor_photo_id: string;
+  face_crop_base64: string | null;
+}
+
+export interface PersonExample {
+  id: string;
+  person_id: string;
+  face_crop_base64: string | null;
+}
+
+export interface FaceStats {
+  photos_pending_detection: number;
+  faces_detected: number;
+  faces_embedded: number;
+}
+
+export type AppView = "library" | "search" | "settings" | "people";
