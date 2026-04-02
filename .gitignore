@@ -9,6 +9,9 @@ dist-ssr/
 src-tauri/target/
 *.pdb
 
+# ── Bundled ONNX models (binary, fetched via scripts/get-models.ps1) ──────────
+src-tauri/models/*.onnx
+
 # ── Tauri ─────────────────────────────────────────────────────────────────────
 src-tauri/gen/
 

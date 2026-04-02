@@ -7,6 +7,7 @@ import { SearchBar } from "./components/SearchBar";
 import { PhotoGrid } from "./components/PhotoGrid";
 import { Inspector } from "./components/Inspector";
 import { Lightbox } from "./components/Lightbox";
+import { PeoplePage } from "./components/PeoplePage";
 import { SettingsPage } from "./components/SettingsPage";
 import { AppView, AuthStatus, Photo, SearchResult, Stats } from "./types";
 
@@ -89,20 +90,8 @@ export default function App() {
       <header className="flex items-center gap-4 px-5 py-3 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur shrink-0">
         {/* Logo */}
         <div className="flex items-center gap-2 mr-2">
-          <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center">
-            <svg
-              className="w-4 h-4 text-white"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909M3.75 18h16.5M3.375 4.5h17.25c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125H3.375A1.125 1.125 0 0 1 2.25 15.375V5.625c0-.621.504-1.125 1.125-1.125Z"
-              />
-            </svg>
+          <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center select-none">
+            <span className="text-white font-bold italic text-base leading-none">f</span>
           </div>
           <span className="font-semibold text-zinc-100 text-sm tracking-tight">Flashback</span>
         </div>
@@ -114,7 +103,7 @@ export default function App() {
 
         {/* Nav */}
         <nav className="flex items-center gap-1 ml-2">
-          {(["library", "settings"] as AppView[]).map((v) => (
+          {(["library", "people", "settings"] as AppView[]).map((v) => (
             <button
               key={v}
               onClick={() => setView(v)}
@@ -147,6 +136,15 @@ export default function App() {
                 refreshAuth();
                 loadLibrary();
               }}
+            />
+          ) : view === "people" ? (
+            <PeoplePage
+              photos={photos}
+              onPersonSearch={(results) => {
+                setSearchResults(results);
+                setView("search");
+              }}
+              onSelect={setSelectedPhoto}
             />
           ) : (
             <div className="max-w-5xl mx-auto p-6">

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Photo {
@@ -21,14 +22,20 @@ pub struct Photo {
     pub thumb_path: Option<String>,
 }
 
-/// Planned for Stage 3 – Face Anchoring.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Person {
     pub id: String,
     pub name: String,
     pub anchor_photo_id: String,
     pub face_crop_base64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Face {
+    pub id: String,
+    pub photo_id: String,
+    pub bbox_json: String,
+    pub vector_json: Option<String>,
 }
 
 pub fn open(db_path: &str) -> Result<Connection> {
@@ -68,6 +75,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             vector_json      TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS person_examples (
+            id               TEXT PRIMARY KEY,
+            person_id        TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            face_crop_base64 TEXT,
+            vector_json      TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_examples_person ON person_examples(person_id);
+
+        CREATE TABLE IF NOT EXISTS faces (
+            id          TEXT PRIMARY KEY,
+            photo_id    TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+            bbox_json   TEXT NOT NULL,
+            vector_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
+
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -87,6 +112,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_photos_created_at ON photos(created_at DESC)",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE photos ADD COLUMN faces_detected INTEGER NOT NULL DEFAULT 0",
         [],
     );
 
@@ -282,7 +311,7 @@ pub fn semantic_search(
          WHERE p.is_video = 0",
         cols = SELECT_COLS
             .split(", ")
-            .map(|c| format!("{c}"))
+            .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(", p.")
     );
@@ -294,8 +323,11 @@ pub fn semantic_search(
             Ok((photo, vec_json))
         })?
         .filter_map(|r| r.ok())
-        .map(|(photo, json)| {
-            let vec: Vec<f32> = serde_json::from_str(&json).unwrap_or_default();
+        .filter_map(|(photo, json)| {
+            let vec: Vec<f32> = serde_json::from_str(&json).ok()?;
+            Some((photo, vec))
+        })
+        .map(|(photo, vec)| {
             let score = cosine_similarity(query_vec, &vec);
             (photo, score)
         })
@@ -304,6 +336,289 @@ pub fn semantic_search(
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     results.truncate(limit);
     Ok(results)
+}
+
+// ── faces ─────────────────────────────────────────────────────────────────────
+
+pub fn insert_face(conn: &Connection, photo_id: &str, bbox_json: &str) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO faces(id, photo_id, bbox_json) VALUES(?1, ?2, ?3)",
+        params![id, photo_id, bbox_json],
+    )?;
+    Ok(id)
+}
+
+pub fn save_face_embedding(conn: &Connection, face_id: &str, vector: &[f32]) -> Result<()> {
+    let json = serde_json::to_string(vector)?;
+    conn.execute(
+        "UPDATE faces SET vector_json=?1 WHERE id=?2",
+        params![json, face_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_faces_for_photo(conn: &Connection, photo_id: &str) -> Result<Vec<Face>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, photo_id, bbox_json, vector_json FROM faces WHERE photo_id=?1",
+    )?;
+    let rows = stmt
+        .query_map(params![photo_id], |row| {
+            Ok(Face {
+                id: row.get(0)?,
+                photo_id: row.get(1)?,
+                bbox_json: row.get(2)?,
+                vector_json: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn delete_faces_for_photo(conn: &Connection, photo_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM faces WHERE photo_id=?1", params![photo_id])?;
+    Ok(())
+}
+
+/// Photos that are indexed, not a video, and haven't had face detection run yet.
+pub fn get_photos_needing_face_detection(conn: &Connection, limit: usize) -> Result<Vec<Photo>> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} FROM photos \
+         WHERE indexed=1 AND is_video=0 AND faces_detected=0 \
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([limit as i64], row_to_photo)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn mark_faces_detected(conn: &Connection, photo_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET faces_detected=1 WHERE id=?1",
+        params![photo_id],
+    )?;
+    Ok(())
+}
+
+/// Faces that have been detected but not yet embedded.
+pub fn get_unembedded_faces(conn: &Connection, limit: usize) -> Result<Vec<Face>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, photo_id, bbox_json, vector_json FROM faces \
+         WHERE vector_json IS NULL LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map([limit as i64], |row| {
+            Ok(Face {
+                id: row.get(0)?,
+                photo_id: row.get(1)?,
+                bbox_json: row.get(2)?,
+                vector_json: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Cosine similarity search over face embeddings. Returns one result per photo,
+/// using the highest-scoring face match per photo.
+pub fn face_search(
+    conn: &Connection,
+    anchor_vec: &[f32],
+    limit: usize,
+) -> Result<Vec<(Photo, f32)>> {
+    let sql = format!(
+        "SELECT p.{cols}, f.vector_json
+         FROM faces f JOIN photos p ON p.id = f.photo_id
+         WHERE f.vector_json IS NOT NULL AND p.is_video = 0",
+        cols = SELECT_COLS
+            .split(", ")
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", p.")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let all_pairs: Vec<(Photo, f32)> = stmt
+        .query_map([], |row| {
+            let photo = row_to_photo(row)?;
+            let vec_json: String = row.get(12)?;
+            Ok((photo, vec_json))
+        })?
+        .filter_map(|r| r.ok())
+        .filter_map(|(photo, json)| {
+            let vec: Vec<f32> = serde_json::from_str(&json).ok()?;
+            Some((photo, vec))
+        })
+        .map(|(photo, vec)| {
+            let score = cosine_similarity(anchor_vec, &vec);
+            (photo, score)
+        })
+        .collect();
+
+    // Keep best score per photo
+    let mut best: HashMap<String, (Photo, f32)> = HashMap::new();
+    for (photo, score) in all_pairs {
+        let entry = best
+            .entry(photo.id.clone())
+            .or_insert((photo.clone(), f32::NEG_INFINITY));
+        if score > entry.1 {
+            *entry = (photo, score);
+        }
+    }
+
+    let mut results: Vec<(Photo, f32)> = best.into_values().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    results.truncate(limit);
+    Ok(results)
+}
+
+// ── people ────────────────────────────────────────────────────────────────────
+
+pub fn insert_person(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    anchor_photo_id: &str,
+    face_crop_base64: Option<&str>,
+    vector_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO people(id, name, anchor_photo_id, face_crop_base64, vector_json) \
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![id, name, anchor_photo_id, face_crop_base64, vector_json],
+    )?;
+    Ok(())
+}
+
+pub fn list_people(conn: &Connection) -> Result<Vec<Person>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, anchor_photo_id, face_crop_base64 FROM people ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                anchor_photo_id: row.get(2)?,
+                face_crop_base64: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn get_person_vector(conn: &Connection, person_id: &str) -> Result<Option<Vec<f32>>> {
+    let mut stmt = conn.prepare("SELECT vector_json FROM people WHERE id=?1")?;
+    let result = stmt.query_row(params![person_id], |row| row.get::<_, Option<String>>(0));
+    match result {
+        Ok(Some(json)) => {
+            let vec: Vec<f32> = serde_json::from_str(&json)?;
+            Ok(Some(vec))
+        }
+        Ok(None) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn delete_person(conn: &Connection, person_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM people WHERE id=?1", params![person_id])?;
+    Ok(())
+}
+
+// ── person examples ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PersonExample {
+    pub id: String,
+    pub person_id: String,
+    pub face_crop_base64: Option<String>,
+}
+
+pub fn insert_person_example(
+    conn: &Connection,
+    person_id: &str,
+    face_crop_base64: Option<&str>,
+    vector_json: &str,
+) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO person_examples(id, person_id, face_crop_base64, vector_json) \
+         VALUES(?1, ?2, ?3, ?4)",
+        params![id, person_id, face_crop_base64, vector_json],
+    )?;
+    Ok(id)
+}
+
+pub fn list_person_examples(conn: &Connection, person_id: &str) -> Result<Vec<PersonExample>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, person_id, face_crop_base64 FROM person_examples WHERE person_id=?1",
+    )?;
+    let rows = stmt
+        .query_map(params![person_id], |row| {
+            Ok(PersonExample {
+                id: row.get(0)?,
+                person_id: row.get(1)?,
+                face_crop_base64: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+pub fn delete_person_example(conn: &Connection, example_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM person_examples WHERE id=?1",
+        params![example_id],
+    )?;
+    Ok(())
+}
+
+/// Recompute the centroid of all examples for a person and store it in people.vector_json.
+/// Returns the new centroid, or None if the person has no examples.
+pub fn recompute_person_centroid(
+    conn: &Connection,
+    person_id: &str,
+) -> Result<Option<Vec<f32>>> {
+    let mut stmt = conn.prepare(
+        "SELECT vector_json FROM person_examples WHERE person_id=?1",
+    )?;
+    let vecs: Vec<Vec<f32>> = stmt
+        .query_map(params![person_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter_map(|json| serde_json::from_str::<Vec<f32>>(&json).ok())
+        .collect();
+
+    if vecs.is_empty() {
+        return Ok(None);
+    }
+
+    let dim = vecs[0].len();
+    let n = vecs.len() as f32;
+    let mut centroid = vec![0.0_f32; dim];
+    for v in &vecs {
+        for (i, x) in v.iter().enumerate() {
+            centroid[i] += x;
+        }
+    }
+    for x in &mut centroid {
+        *x /= n;
+    }
+
+    let json = serde_json::to_string(&centroid)?;
+    conn.execute(
+        "UPDATE people SET vector_json=?1 WHERE id=?2",
+        params![json, person_id],
+    )?;
+
+    Ok(Some(centroid))
 }
 
 // ── settings ──────────────────────────────────────────────────────────────────

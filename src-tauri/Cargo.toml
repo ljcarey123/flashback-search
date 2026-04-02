@@ -33,6 +33,7 @@ dirs-next = "2"
 keyring = { version = "3", features = ["windows-native"] }
 walkdir = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff"] }
+tract-onnx = "0.21"
 
 [dev-dependencies]
 tempfile = "3"

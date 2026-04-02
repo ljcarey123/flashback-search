@@ -1,7 +1,10 @@
 use crate::db::{
-    cosine_similarity, find_by_fingerprint, get_all_photos, get_setting, get_unindexed_photos,
-    insert_photo_if_new, migrate, reset_index, save_embedding, semantic_search, set_setting,
-    upsert_photos, Photo,
+    cosine_similarity, delete_faces_for_photo, delete_person, face_search, find_by_fingerprint,
+    get_all_photos, get_photos_needing_face_detection, get_setting, get_unembedded_faces,
+    get_unindexed_photos, insert_face, insert_person, insert_person_example,
+    insert_photo_if_new, list_people, list_person_examples, mark_faces_detected, migrate,
+    recompute_person_centroid, reset_index, save_embedding, save_face_embedding,
+    semantic_search, set_setting, upsert_photos, Photo,
 };
 use rusqlite::Connection;
 
@@ -45,7 +48,9 @@ fn migrate_creates_tables() {
     };
     assert!(tables.contains(&"photos".to_string()));
     assert!(tables.contains(&"embeddings".to_string()));
+    assert!(tables.contains(&"faces".to_string()));
     assert!(tables.contains(&"people".to_string()));
+    assert!(tables.contains(&"person_examples".to_string()));
     assert!(tables.contains(&"settings".to_string()));
 }
 
@@ -337,6 +342,144 @@ fn settings_upsert_overwrites() {
     set_setting(&conn, "key", "v1").unwrap();
     set_setting(&conn, "key", "v2").unwrap();
     assert_eq!(get_setting(&conn, "key").unwrap(), Some("v2".to_string()));
+}
+
+// ── faces ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn insert_face_returns_id_and_is_retrievable() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    let id = insert_face(&conn, "p1", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+    assert!(!id.is_empty());
+
+    let faces = crate::db::get_faces_for_photo(&conn, "p1").unwrap();
+    assert_eq!(faces.len(), 1);
+    assert_eq!(faces[0].id, id);
+    assert!(faces[0].vector_json.is_none());
+}
+
+#[test]
+fn save_face_embedding_stores_vector() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    let id = insert_face(&conn, "p1", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+    save_face_embedding(&conn, &id, &[0.5_f32, 0.5]).unwrap();
+
+    let faces = crate::db::get_faces_for_photo(&conn, "p1").unwrap();
+    assert!(faces[0].vector_json.is_some());
+}
+
+#[test]
+fn get_unembedded_faces_excludes_embedded() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    let id1 = insert_face(&conn, "p1", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+    let id2 = insert_face(&conn, "p1", r#"{"x":0.5,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+    save_face_embedding(&conn, &id1, &[1.0_f32]).unwrap();
+
+    let unembedded = get_unembedded_faces(&conn, 100).unwrap();
+    let ids: Vec<&str> = unembedded.iter().map(|f| f.id.as_str()).collect();
+    assert!(!ids.contains(&id1.as_str()), "embedded face excluded");
+    assert!(ids.contains(&id2.as_str()), "unembedded face included");
+}
+
+#[test]
+fn delete_faces_for_photo_removes_all() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    insert_face(&conn, "p1", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+    insert_face(&conn, "p1", r#"{"x":0.5,"y":0.1,"w":0.2,"h":0.3}"#).unwrap();
+
+    delete_faces_for_photo(&conn, "p1").unwrap();
+    let faces = crate::db::get_faces_for_photo(&conn, "p1").unwrap();
+    assert!(faces.is_empty());
+}
+
+#[test]
+fn mark_faces_detected_sets_flag() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    conn.execute("UPDATE photos SET indexed=1 WHERE id='p1'", []).unwrap();
+
+    let pending = get_photos_needing_face_detection(&conn, 100).unwrap();
+    assert!(pending.iter().any(|p| p.id == "p1"));
+
+    mark_faces_detected(&conn, "p1").unwrap();
+    let pending2 = get_photos_needing_face_detection(&conn, 100).unwrap();
+    assert!(!pending2.iter().any(|p| p.id == "p1"));
+}
+
+#[test]
+fn face_search_returns_photo_with_best_score() {
+    let conn = test_db();
+    let mut p1 = sample_photo("p1");
+    p1.fingerprint = Some("111_p1.jpg".to_string());
+    let mut p2 = sample_photo("p2");
+    p2.fingerprint = Some("222_p2.jpg".to_string());
+    upsert_photos(&conn, &[p1, p2]).unwrap();
+
+    let id1 = insert_face(&conn, "p1", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.2}"#).unwrap();
+    let id2 = insert_face(&conn, "p2", r#"{"x":0.1,"y":0.1,"w":0.2,"h":0.2}"#).unwrap();
+    save_face_embedding(&conn, &id1, &[1.0_f32, 0.0]).unwrap();
+    save_face_embedding(&conn, &id2, &[0.0_f32, 1.0]).unwrap();
+
+    let results = face_search(&conn, &[1.0_f32, 0.0], 10).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0.id, "p1");
+    assert!(results[0].1 > results[1].1);
+}
+
+// ── people ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn insert_and_list_people() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    insert_person(&conn, "person1", "Alice", "p1", None, "[0.1, 0.2]").unwrap();
+    insert_person(&conn, "person2", "Bob", "p1", None, "[0.3, 0.4]").unwrap();
+
+    let people = list_people(&conn).unwrap();
+    assert_eq!(people.len(), 2);
+    // Ordered by name
+    assert_eq!(people[0].name, "Alice");
+    assert_eq!(people[1].name, "Bob");
+}
+
+#[test]
+fn delete_person_removes_row() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    insert_person(&conn, "person1", "Alice", "p1", None, "[]").unwrap();
+    delete_person(&conn, "person1").unwrap();
+    assert!(list_people(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn recompute_centroid_averages_examples() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    insert_person(&conn, "person1", "Alice", "p1", None, "[]").unwrap();
+
+    insert_person_example(&conn, "person1", None, "[1.0, 0.0]").unwrap();
+    insert_person_example(&conn, "person1", None, "[0.0, 1.0]").unwrap();
+
+    let centroid = recompute_person_centroid(&conn, "person1").unwrap().unwrap();
+    assert_eq!(centroid.len(), 2);
+    assert!((centroid[0] - 0.5).abs() < 1e-5);
+    assert!((centroid[1] - 0.5).abs() < 1e-5);
+}
+
+#[test]
+fn list_person_examples_returns_all() {
+    let conn = test_db();
+    upsert_photos(&conn, &[sample_photo("p1")]).unwrap();
+    insert_person(&conn, "person1", "Alice", "p1", None, "[]").unwrap();
+    insert_person_example(&conn, "person1", None, "[1.0]").unwrap();
+    insert_person_example(&conn, "person1", None, "[2.0]").unwrap();
+
+    let examples = list_person_examples(&conn, "person1").unwrap();
+    assert_eq!(examples.len(), 2);
 }
 
 // ── reset_index ───────────────────────────────────────────────────────────────

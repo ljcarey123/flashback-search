@@ -1,29 +1,12 @@
 # Flashback
 
-Search your entire photo library with natural language. *"me at the beach"*, *"birthday cake 2023"*, *"the dog on the sofa"* — results appear in under 100ms. Everything runs locally. Your photos never leave your machine.
+A Windows desktop app for semantic and face-based search over a personal Google Photos library. All indexing and search runs locally — no cloud query service, no ongoing API dependency once photos are imported.
 
 ---
 
-## What it is
+## What it does
 
-Flashback is a Windows desktop app that builds a private, searchable index of your Google Photos library using multimodal AI embeddings. Once indexed, you can search across thousands of photos using free-form language rather than folders, dates, or tags.
-
-It works by generating a 1536-dimension semantic vector for each photo using Gemini's multimodal embedding model. When you search, your text query is embedded with the same model, and cosine similarity ranks the closest matches — returning visually and contextually relevant results instantly from a local SQLite database.
-
-No cloud search service. No photo uploads for querying. No subscription.
-
----
-
-## Why it's interesting
-
-Most photo apps search by metadata — date, album, filename, maybe an auto-generated tag. Flashback searches by *meaning*. The same model that understands what's in an image also understands what you're asking for, so results reflect semantic intent rather than keyword matching.
-
-A few things make this technically interesting:
-
-- **No native vector extension required.** Rather than pulling in `sqlite-vec` (which requires a compiled C extension), cosine similarity runs in pure Rust against raw float32 vectors stored in SQLite. This keeps the binary self-contained and the build simple.
-- **Dual import paths with no Google API dependency for search.** Bulk libraries come in via Google Takeout (no auth, no API quota). Incremental imports use the Google Photos Picker API (OAuth, browser-based selection). Once a photo is imported and its thumbnail is on disk, all indexing and search runs fully offline.
-- **Concurrent AI pipeline.** For each photo, a Gemini Vision description and a Gemini embedding are generated concurrently via `tokio::join!`, keeping indexing throughput high without blocking.
-- **Secure credential storage.** The Gemini API key and Google OAuth tokens are stored in the Windows Credential Manager — never written to disk in plaintext.
+Photos are indexed by generating a 1536-dimension semantic vector per image using Gemini's multimodal embedding model. Queries are embedded with the same model and ranked by cosine similarity against the local index. The People Engine adds a parallel face-similarity layer: faces are detected and embedded using local ONNX models, and person search finds photos by face likeness rather than semantic content. Both systems compose — you can filter semantically and by person.
 
 ---
 
@@ -36,50 +19,102 @@ A few things make this technically interesting:
 | Database | SQLite via `rusqlite` (bundled, no native extensions) |
 | AI — Embeddings | Gemini Embedding (`gemini-embedding-2-preview`, 1536 dims) |
 | AI — Descriptions | Gemini Flash (`gemini-2.5-flash`) |
+| Face detection | Ultra-Light RFB-320 via `tract-onnx` |
+| Face embeddings | MobileFaceNet via `tract-onnx` |
 | Photo import | Google Takeout (bulk) · Google Photos Picker API (incremental) |
 | Secret storage | Windows Credential Manager via `keyring` crate |
 
 ---
 
-## Roadmap
+## Technical decisions
 
-### Done
+**Cosine similarity in pure Rust, no vector extension.**
+`sqlite-vec` and similar extensions require a compiled C dependency, which complicates cross-machine builds. Instead, raw `float32` vectors are stored as JSON blobs in SQLite and similarity is computed in Rust on every query. This is O(n) and works well up to ~100k photos on modern hardware. The natural upgrade path when this becomes a bottleneck is HNSW indexing via `usearch` or `sqlite-vec`'s built-in HNSW support — but that adds build complexity for a gain that isn't yet needed.
 
-| Stage | What shipped |
-|---|---|
-| Import & Auth | Google Takeout bulk import + Google Photos Picker API incremental sync. Deduplication across both sources. 512px thumbnails generated locally. |
-| Vector Engine | Incremental batch indexing — Gemini Vision description + embedding generated concurrently per photo. Re-index support. |
-| Semantic Search | Text query → embedding → cosine similarity against local index. Sub-100ms results. |
-| Save Layer | Download full-resolution originals to `Pictures\Flashback`. Takeout originals referenced in-place. |
-| UI Polish | Animated photo grid with staggered entrances, resizable inspector panel, full-screen lightbox. |
+**ONNX inference via `tract`, no Python or TensorFlow at runtime.**
+The face pipeline uses two bundled `.onnx` model files and runs entirely in-process via `tract-onnx`, a pure-Rust ONNX inference library. This keeps the shipped binary self-contained — no Python runtime, no native ML framework. The models are small enough (Ultra-Light ~1.2MB, MobileFaceNet ~4.9MB) that bundling them as Tauri resources is straightforward.
 
-### Next
+The MobileFaceNet model required a non-trivial conversion pipeline. The original TensorFlow checkpoint uses `tf.cond(phase_train, ...)` inside every BatchNorm layer — a training/inference branch that tf2onnx faithfully converts to ONNX `If` nodes. `tract` does not implement the `If` op. The fix was to fold `phase_train=False` as a constant initializer, then run `onnx-simplifier` to constant-propagate through the graph. This collapsed 104 `If` nodes and all their training-branch ops (ReduceMean, ReduceVariance, Shape, Gather, Cast) into flat inference ops, reducing the model from 5.4MB to 4.9MB and producing a graph tract can execute.
 
-**Sort by date**
-The library and search results currently return photos in DB insertion order. Sorting by `created_at` descending is a small change with a big impact on usability.
+**Dual import paths.**
+The Google Photos Library API was deprecated before this project started. The replacement is a hybrid: Google Takeout for bulk one-time imports (no auth, no quota), and the Google Photos Picker API for incremental additions (OAuth, browser-based session). Deduplication uses a `{unix_timestamp}_{filename}` fingerprint that's stable across both sources. Once a thumbnail is on disk, all indexing and search is fully offline.
 
-**People Engine**
-Associate photos with specific people. The working concept: pick a reference photo of a person, crop the face, generate a face embedding, and use it as an anchor for filtered search — *"find all photos that include this person"*. This is face-similarity search rather than semantic search; the two systems would compose. Planned stack: Google Cloud Vision API for face detection (bounding boxes) + MobileFaceNet via ONNX Runtime in Rust for local face embeddings.
+**Localhost OAuth redirect.**
+The Picker auth flow uses a `tokio::TcpListener` on localhost to catch the OAuth `?code=` redirect from the browser — avoiding the deprecated OOB copy-paste flow and keeping the experience closer to a normal web OAuth handshake.
 
-**Packaging & onboarding**
-Installer, first-run setup flow, and clear credential guidance for the portfolio release.
+**Concurrent indexing pipeline.**
+For each photo, a Gemini Vision description and a Gemini embedding are requested concurrently via `tokio::join!`. The two API calls are independent, so running them in parallel roughly halves indexing time per photo.
+
+**Secure credential storage.**
+The Gemini API key and Google OAuth tokens are stored in the Windows Credential Manager via the `keyring` crate — never written to disk as plaintext.
 
 ---
 
-### Discussion / Deferred
+## What's implemented
+
+| Area | Detail |
+|---|---|
+| Import | Takeout bulk import + Picker incremental sync. Deduplication across both. 512px thumbnails generated locally. |
+| Semantic indexing | Gemini Vision description + embedding per photo, concurrently. Batched with progress tracking. Re-index support. |
+| Semantic search | Text → embedding → cosine similarity over local index. |
+| Save layer | Download full-resolution originals to `Pictures\Flashback`. Takeout originals referenced in-place. |
+| People engine | Batch face detection (Ultra-Light) + embedding (MobileFaceNet) across the full library. Person management: add/delete people, multiple reference examples per person, centroid averaging across examples. Face-similarity search with adjustable threshold. |
+| UI | Animated photo grid, resizable inspector panel, full-screen lightbox, People page with face bbox overlay for reference selection. |
+
+---
+
+## Next tasks
+
+**ANN indexing for scale**
+The current linear scan is fast enough for personal libraries but degrades at scale. The right fix is approximate nearest-neighbour search using HNSW (Hierarchical Navigable Small World graphs). Both `usearch` (Rust bindings) and `sqlite-vec`'s built-in HNSW index are viable options. This applies to both the semantic search index and the face embedding index. Deferring until the linear scan is measurably slow is reasonable; the upgrade path is well-defined.
+
+**Better face models**
+Ultra-Light RFB-320 and MobileFaceNet are deliberately lightweight models — fast on CPU, easy to bundle, permissively licensed. The accuracy ceiling is low: small faces, off-angle faces, and occlusion all cause missed detections. Replacements to consider:
+- Detection: **YuNet** (OpenCV's built-in detector) or **RetinaFace** — meaningfully better recall, still CPU-viable
+- Embedding: **ArcFace ResNet-50** — significantly higher recognition accuracy at the cost of a larger model and slower per-face embedding
+
+**Auto-clustering**
+Before a user names anyone, run agglomerative clustering over all face embeddings to surface candidate groups. Present these as unlabelled clusters for the user to name, rather than requiring manual reference photo selection. This scales better for large libraries and removes the need to know in advance which photos show which people.
+
+**Combined search**
+The semantic and face systems are currently separate query paths. A combined mode — filter by person *and* semantic query — would require intersecting the two result sets, which is straightforward given both return sets of photo IDs with scores.
+
+**Background indexing**
+Face detection and embedding currently run as an explicit manual step. The natural behaviour is to run incrementally on import: detect and embed faces for newly imported photos without user intervention, keeping the index current.
+
+**Packaging and onboarding**
+Installer, first-run setup flow, and clear credential guidance. The ONNX model acquisition (`scripts/get-models.ps1`) should be integrated into the build or setup step rather than documented as a manual prerequisite.
+
+**Playwright integration tests**
+The existing frontend tests (Vitest + React Testing Library) mock Tauri's `invoke` layer, so they don't cover the Rust↔JS boundary. Playwright with `tauri-driver` can drive the real app via WebDriver. Worth adding for the core flows — import trigger, search, person creation — where bugs at the IPC boundary would only surface at runtime.
+
+---
+
+### Deferred
 
 **Location data**
-Google Photos Picker API does not expose GPS coordinates. Location is available via EXIF in downloaded originals and via `geoData` fields in Google Takeout JSON sidecars — but since Picker is the preferred import path for this project, location support is deferred until there is a clear use case (e.g. map view, location-based search). Worth revisiting once the People Engine is stable.
+The Picker API does not expose GPS coordinates. EXIF location is available in Takeout originals and JSON sidecars, but since Picker is the primary import path this isn't consistently available. Deferred until there's a clear use case (map view, location search) and a reliable data source.
 
 ---
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) 1.85+
 - [Node.js](https://nodejs.org/) 18+
 - [Tauri prerequisites for Windows](https://tauri.app/start/prerequisites/)
+- Python 3.8+ with pip (for first-time model setup only)
+
+### First-time model setup
+
+The face models are not committed to the repository. Run once before the first build:
+
+```powershell
+.\scripts\get-models.ps1
+```
+
+This downloads the Ultra-Light detector and converts MobileFaceNet from TensorFlow to ONNX, including the constant-folding step required for `tract` compatibility.
 
 ### Run
 
@@ -88,17 +123,17 @@ npm install
 npm run tauri dev
 ```
 
-### You'll need
+### Credentials
 
-1. **Gemini API key** — from [Google AI Studio](https://aistudio.google.com/). Models used: `gemini-embedding-2-preview` and `gemini-2.5-flash`. Free tier is sufficient for personal libraries.
+1. **Gemini API key** — from [Google AI Studio](https://aistudio.google.com/). Models: `gemini-embedding-2-preview` and `gemini-2.5-flash`. Free tier is sufficient.
 
-2. **Google Cloud credentials** (optional — only required for Picker import) — create an OAuth 2.0 "Desktop app" client in [Google Cloud Console](https://console.cloud.google.com/). Enable the **Google Photos Picker API**. Required scopes:
+2. **Google Cloud credentials** (optional — Picker import only) — OAuth 2.0 Desktop app client from [Google Cloud Console](https://console.cloud.google.com/). Enable the **Google Photos Picker API**. Scopes required:
    - `https://www.googleapis.com/auth/photospicker.mediaitems.readonly`
    - `https://www.googleapis.com/auth/userinfo.profile`
 
-   > Google Takeout import works without any credentials. Export your library at [takeout.google.com](https://takeout.google.com), unzip, and point Flashback at the folder.
+   > Takeout import requires no credentials. Export at [takeout.google.com](https://takeout.google.com), unzip, and point Flashback at the folder.
 
-Enter both in the **Settings** page. Keys are stored in the Windows Credential Manager — never written to disk in plaintext.
+Enter credentials in the **Settings** page. Both are stored in Windows Credential Manager.
 
 ---
 
@@ -112,17 +147,17 @@ npm run test:watch     # watch mode
 npm run test:coverage  # with coverage report
 ```
 
-Uses **Vitest** + **React Testing Library**. Tauri's `invoke`, `listen`, and `plugin-dialog` are mocked — no binary required.
+Vitest + React Testing Library. Tauri's `invoke`, `listen`, and `plugin-dialog` are mocked — no binary required.
 
 ### Rust — 39 tests
 
 ```bash
 npm run rust:test
-# or directly:
+# or:
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Uses in-memory SQLite and `mockito` for HTTP responses.
+In-memory SQLite and `mockito` for HTTP responses.
 
 ---
 
@@ -144,14 +179,18 @@ npm run tauri build    # Production .exe
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 flashback-search/
+├── scripts/
+│   └── get-models.ps1                # One-time ONNX model acquisition
 ├── src/                              # React frontend
 │   ├── components/
-│   │   ├── Inspector.tsx             # Resizable side panel: metadata + download + zoom
+│   │   ├── FaceSelector.tsx          # Face bbox overlay for reference photo selection
+│   │   ├── Inspector.tsx             # Resizable side panel: metadata + download
 │   │   ├── Lightbox.tsx              # Full-screen image overlay
+│   │   ├── PeoplePage.tsx            # People engine UI: indexing, person management, search
 │   │   ├── PhotoGrid.tsx             # Animated photo grid
 │   │   ├── SearchBar.tsx             # Natural language search input
 │   │   └── SettingsPage.tsx          # Import, auth, and indexing controls
@@ -159,7 +198,8 @@ flashback-search/
 │   └── types.ts
 └── src-tauri/src/                    # Rust backend
     ├── commands.rs                   # All Tauri command handlers
-    ├── db.rs                         # SQLite schema, queries, cosine similarity
+    ├── db.rs                         # SQLite schema, queries, cosine similarity, face search
+    ├── face.rs                       # ONNX face detection + embedding pipeline
     ├── gemini.rs                     # Gemini Embedding + Vision API client
     ├── google.rs                     # Google OAuth + Picker API client
     ├── takeout.rs                    # Takeout folder scanner + sidecar parser

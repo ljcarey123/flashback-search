@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod face;
 mod gemini;
 mod google;
 pub(crate) mod secrets;
@@ -36,10 +37,18 @@ pub fn run() {
                 .build()
                 .expect("Failed to build HTTP client");
 
+            // Face models are bundled as Tauri resources under src-tauri/models/.
+            let resource_dir = app.path().resource_dir()
+                .expect("Failed to resolve resource dir");
+            let face_detect_model = resource_dir.join("models").join("face_detect.onnx");
+            let face_embed_model = resource_dir.join("models").join("face_embed.onnx");
+
             app.manage(AppState {
                 db: Mutex::new(conn),
                 http,
                 data_dir,
+                face_detect_model,
+                face_embed_model,
             });
 
             Ok(())
@@ -60,6 +69,17 @@ pub fn run() {
             commands::load_settings,
             commands::get_db_path,
             commands::debug_token,
+            commands::detect_faces_batch,
+            commands::embed_faces_batch,
+            commands::detect_faces_for_photo,
+            commands::list_people,
+            commands::create_person,
+            commands::add_person_example,
+            commands::delete_person,
+            commands::search_by_person,
+            commands::get_face_stats,
+            commands::list_person_examples,
+            commands::delete_person_example,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Flashback");
