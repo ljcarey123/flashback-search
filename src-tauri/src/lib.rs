@@ -1,15 +1,14 @@
 mod commands;
 mod db;
-mod face;
-mod gemini;
-mod google;
+mod integrations;
 pub(crate) mod secrets;
-mod takeout;
+mod services;
+mod state;
 
 #[cfg(test)]
 mod tests;
 
-use commands::AppState;
+use state::AppState;
 use std::sync::Mutex;
 use tauri::Manager;
 
@@ -37,49 +36,50 @@ pub fn run() {
                 .build()
                 .expect("Failed to build HTTP client");
 
-            // Face models are bundled as Tauri resources under src-tauri/models/.
             let resource_dir = app.path().resource_dir()
                 .expect("Failed to resolve resource dir");
-            let face_detect_model = resource_dir.join("models").join("face_detect.onnx");
-            let face_embed_model = resource_dir.join("models").join("face_embed.onnx");
+            let face = integrations::face::FaceEngine::load(
+                &resource_dir.join("models").join("face_detect.onnx"),
+                &resource_dir.join("models").join("face_embed.onnx"),
+            )
+            .expect("Failed to load face models");
 
             app.manage(AppState {
                 db: Mutex::new(conn),
                 http,
                 data_dir,
-                face_detect_model,
-                face_embed_model,
+                face,
             });
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::start_auth_flow,
-            commands::get_auth_status,
-            commands::sign_out,
-            commands::import_takeout,
-            commands::run_picker_import,
-            commands::reset_index,
-            commands::index_next_batch,
-            commands::search,
-            commands::get_library,
-            commands::get_stats,
-            commands::download_photo,
-            commands::save_settings,
-            commands::load_settings,
-            commands::get_db_path,
-            commands::debug_token,
-            commands::detect_faces_batch,
-            commands::embed_faces_batch,
-            commands::detect_faces_for_photo,
-            commands::list_people,
-            commands::create_person,
-            commands::add_person_example,
-            commands::delete_person,
-            commands::search_by_person,
-            commands::get_face_stats,
-            commands::list_person_examples,
-            commands::delete_person_example,
+            commands::auth::start_auth_flow,
+            commands::auth::get_auth_status,
+            commands::auth::sign_out,
+            commands::import::import_takeout,
+            commands::import::run_picker_import,
+            commands::index::reset_index,
+            commands::index::index_next_batch,
+            commands::library::search,
+            commands::library::get_library,
+            commands::library::get_stats,
+            commands::library::download_photo,
+            commands::settings::save_settings,
+            commands::settings::load_settings,
+            commands::library::get_db_path,
+            commands::debug::debug_token,
+            commands::people::detect_faces_batch,
+            commands::people::embed_faces_batch,
+            commands::people::detect_faces_for_photo,
+            commands::people::list_people,
+            commands::people::create_person,
+            commands::people::add_person_example,
+            commands::people::delete_person,
+            commands::people::search_by_person,
+            commands::people::get_face_stats,
+            commands::people::list_person_examples,
+            commands::people::delete_person_example,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Flashback");

@@ -132,7 +132,6 @@ pub async fn start_oauth_server() -> Result<(u16, tokio::sync::oneshot::Receiver
             let n = stream.read(&mut buf).await.unwrap_or(0);
             let request = String::from_utf8_lossy(&buf[..n]);
 
-            // Send a friendly success page back to the browser
             let html = concat!(
                 "HTTP/1.1 200 OK\r\n",
                 "Content-Type: text/html; charset=utf-8\r\n\r\n",
@@ -153,7 +152,6 @@ pub async fn start_oauth_server() -> Result<(u16, tokio::sync::oneshot::Receiver
 }
 
 /// Extract `code` from the first line of an HTTP/1.1 GET request.
-/// e.g. `GET /?code=4%2F0AX...&scope=... HTTP/1.1`
 pub(crate) fn parse_oauth_code(request: &str) -> Option<String> {
     let first_line = request.lines().next()?;
     let path = first_line.split_whitespace().nth(1)?;
@@ -268,8 +266,6 @@ fn parse_dim(v: Option<&serde_json::Value>) -> Option<i64> {
 
 // ── Picker API functions ──────────────────────────────────────────────────────
 
-/// Create a new Picker session.  Returns the session id and the URL to open in
-/// the browser so the user can select photos.
 pub async fn create_picker_session(client: &Client, access_token: &str) -> Result<PickerSession> {
     let resp = client
         .post(format!("{PICKER_API}/sessions"))
@@ -289,8 +285,6 @@ pub async fn create_picker_session(client: &Client, access_token: &str) -> Resul
     })
 }
 
-/// Poll a Picker session.  Returns `true` once the user has finished
-/// selecting photos (`mediaItemsSet = true`).
 pub async fn poll_picker_session(
     client: &Client,
     access_token: &str,
@@ -310,7 +304,6 @@ pub async fn poll_picker_session(
     Ok(parsed.media_items_set)
 }
 
-/// Retrieve all media items selected in the given session (handles pagination).
 pub async fn list_picker_items(
     client: &Client,
     access_token: &str,
@@ -386,7 +379,6 @@ pub async fn list_picker_items(
     Ok(all)
 }
 
-/// Delete a Picker session (cleanup — best-effort, errors are ignored).
 pub async fn delete_picker_session(
     client: &Client,
     access_token: &str,
@@ -400,7 +392,6 @@ pub async fn delete_picker_session(
     Ok(())
 }
 
-/// Download raw bytes from a URL with an Authorization: Bearer token.
 pub async fn download_bytes(client: &Client, url: &str, token: &str) -> Result<Vec<u8>> {
     let resp = client
         .get(url)
@@ -421,6 +412,3 @@ pub fn iso_to_unix(iso: &str) -> Option<String> {
         .ok()
         .map(|dt| dt.timestamp().to_string())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-

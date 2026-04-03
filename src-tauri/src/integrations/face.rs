@@ -27,6 +27,36 @@ pub struct FaceBbox {
 
 type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
+// ── FaceEngine ────────────────────────────────────────────────────────────────
+
+/// Holds both loaded ONNX models so they are compiled once at startup
+/// rather than reloaded on every command call.
+pub struct FaceEngine {
+    detect: OnnxModel,
+    embed: OnnxModel,
+}
+
+impl FaceEngine {
+    pub fn load(detect_path: &Path, embed_path: &Path) -> Result<Self> {
+        Ok(Self {
+            detect: load_detection_model(detect_path)?,
+            embed: load_embedding_model(embed_path)?,
+        })
+    }
+
+    pub fn detect(&self, image_bytes: &[u8]) -> Result<Vec<FaceBbox>> {
+        detect_faces(&self.detect, image_bytes)
+    }
+
+    /// Crop a face from `image_bytes` using `bbox`, embed it, and return
+    /// both the JPEG crop bytes and the embedding vector.
+    pub fn crop_and_embed(&self, image_bytes: &[u8], bbox: &FaceBbox) -> Result<(Vec<u8>, Vec<f32>)> {
+        let crop = crop_face_bytes(image_bytes, bbox)?;
+        let vector = embed_face(&self.embed, &crop)?;
+        Ok((crop, vector))
+    }
+}
+
 // ── Model loading ─────────────────────────────────────────────────────────────
 
 pub fn load_detection_model(path: &Path) -> Result<OnnxModel> {
@@ -93,7 +123,7 @@ pub fn detect_faces(model: &OnnxModel, image_bytes: &[u8]) -> Result<Vec<FaceBbo
     let boxes = result[1].to_array_view::<f32>()?;
 
     let confidence_threshold = 0.7_f32;
-    let mut candidates: Vec<(f32, f32, f32, f32, f32)> = Vec::new(); // (score, x1, y1, x2, y2)
+    let mut candidates: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
 
     let n_anchors = scores.shape()[1];
     for i in 0..n_anchors {
@@ -155,7 +185,6 @@ pub fn embed_face(model: &OnnxModel, crop_bytes: &[u8]) -> Result<Vec<f32>> {
     let rgb = resized.to_rgb8();
 
     // Build NHWC tensor, normalised to [-1, 1]: (p - 127.5) / 128.0
-    // The MobileFaceNet TF model uses channel-last layout [1, 112, 112, 3].
     const S: usize = 112;
     let mut data = vec![0.0_f32; S * S * 3];
     for (i, pixel) in rgb.pixels().enumerate() {

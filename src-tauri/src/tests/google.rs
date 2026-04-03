@@ -1,4 +1,4 @@
-use crate::google::{auth_url, iso_to_unix, parse_oauth_code, url_decode};
+use crate::integrations::google::{auth_url, iso_to_unix, parse_oauth_code, url_decode};
 
 #[test]
 fn auth_url_contains_client_id() {
