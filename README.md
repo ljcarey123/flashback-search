@@ -149,7 +149,7 @@ npm run test:coverage  # with coverage report
 
 Vitest + React Testing Library. Tauri's `invoke`, `listen`, and `plugin-dialog` are mocked — no binary required.
 
-### Rust — 39 tests
+### Rust — 53 tests
 
 ```bash
 npm run rust:test
@@ -187,6 +187,7 @@ flashback-search/
 │   └── get-models.ps1                # One-time ONNX model acquisition
 ├── src/                              # React frontend
 │   ├── components/
+│   │   ├── __tests__/                # Component tests (Vitest + React Testing Library)
 │   │   ├── FaceSelector.tsx          # Face bbox overlay for reference photo selection
 │   │   ├── Inspector.tsx             # Resizable side panel: metadata + download
 │   │   ├── Lightbox.tsx              # Full-screen image overlay
@@ -197,12 +198,28 @@ flashback-search/
 │   ├── App.tsx
 │   └── types.ts
 └── src-tauri/src/                    # Rust backend
-    ├── commands.rs                   # All Tauri command handlers
-    ├── db.rs                         # SQLite schema, queries, cosine similarity, face search
-    ├── face.rs                       # ONNX face detection + embedding pipeline
-    ├── gemini.rs                     # Gemini Embedding + Vision API client
-    ├── google.rs                     # Google OAuth + Picker API client
-    ├── takeout.rs                    # Takeout folder scanner + sidecar parser
+    ├── commands/                     # Tauri command handlers (one file per domain)
+    │   ├── auth.rs                   # Google OAuth flow
+    │   ├── import.rs                 # Takeout + Picker import
+    │   ├── index.rs                  # Semantic indexing
+    │   ├── library.rs                # Photo browsing + download
+    │   ├── people.rs                 # Face detection, person management, face search
+    │   ├── settings.rs               # API key configuration
+    │   └── debug.rs                  # Token inspection
+    ├── db/                           # SQLite layer
+    │   ├── mod.rs                    # Types, open/migrate, cosine_similarity
+    │   ├── photos.rs                 # Photo CRUD + semantic search
+    │   ├── faces.rs                  # Face CRUD + face search + stats
+    │   ├── people.rs                 # Person + example CRUD + centroid
+    │   └── settings.rs               # Key-value settings store
+    ├── integrations/                 # External dependency wrappers
+    │   ├── face.rs                   # ONNX face detection + embedding (tract)
+    │   ├── gemini.rs                 # Gemini Embedding + Vision API
+    │   ├── google.rs                 # Google OAuth + Picker API
+    │   └── takeout.rs                # Takeout folder scanner + sidecar parser
+    ├── services/
+    │   └── people.rs                 # PeopleService: create person, add example, detect faces
+    ├── state.rs                      # AppState (db, http client, face engine, data dir)
     └── secrets.rs                    # Windows Credential Manager wrapper
 ```
 

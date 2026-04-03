@@ -52,9 +52,6 @@ pub struct TakeoutEntry {
 }
 
 /// Walk `folder` recursively and return every image/video entry found.
-///
-/// Files that cannot be read or are not recognised image/video types are
-/// silently skipped.  Sidecar JSON files are never returned as entries.
 pub fn scan_folder(folder: &Path) -> Vec<TakeoutEntry> {
     WalkDir::new(folder)
         .follow_links(true)
@@ -98,7 +95,6 @@ fn entry_from_path(path: &Path) -> Option<TakeoutEntry> {
                 .and_then(|t| t.timestamp.clone())
         })
         .or_else(|| {
-            // Fall back to file modification time
             std::fs::metadata(path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -131,11 +127,7 @@ fn entry_from_path(path: &Path) -> Option<TakeoutEntry> {
 }
 
 /// Try to load and parse the JSON sidecar for a given media file.
-///
-/// Google Takeout names the sidecar `{filename}.json`.  For very long
-/// filenames the base may be truncated, so we also try `{stem}.json`.
 fn read_sidecar(media_path: &Path) -> Result<Sidecar> {
-    // Primary: "photo.jpg.json"
     let primary = media_path.with_file_name(format!(
         "{}.json",
         media_path
@@ -149,7 +141,6 @@ fn read_sidecar(media_path: &Path) -> Result<Sidecar> {
         return Ok(serde_json::from_str(&text).unwrap_or_default());
     }
 
-    // Fallback: "photo.json" (no image extension in the sidecar name)
     let fallback = media_path.with_extension("json");
     if fallback.exists() {
         let text = std::fs::read_to_string(&fallback)
@@ -159,6 +150,3 @@ fn read_sidecar(media_path: &Path) -> Result<Sidecar> {
 
     Ok(Sidecar::default())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-

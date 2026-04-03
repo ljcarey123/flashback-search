@@ -89,4 +89,3 @@ async fn call_embed(client: &Client, api_key: &str, body: Value) -> Result<Vec<f
         .filter_map(|x| x.as_f64().map(|f| f as f32))
         .collect())
 }
-

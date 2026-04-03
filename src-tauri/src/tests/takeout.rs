@@ -1,4 +1,4 @@
-use crate::takeout::scan_folder;
+use crate::integrations::takeout::scan_folder;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
