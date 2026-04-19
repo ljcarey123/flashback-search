@@ -85,9 +85,16 @@ export default function App() {
   const displayItems = view === "search" && searchResults ? searchResults : sortedPhotos;
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-zinc-950">
+    <div className="flex flex-col h-screen overflow-hidden bg-zinc-950 relative">
+      {/* Background gradient orbs */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none z-0">
+        <div className="absolute -top-40 -left-40 w-96 h-96 bg-violet-600/10 rounded-full blur-3xl" />
+        <div className="absolute top-1/2 -right-40 w-80 h-80 bg-violet-500/7 rounded-full blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 w-72 h-72 bg-violet-700/8 rounded-full blur-3xl" />
+      </div>
+
       {/* Top bar */}
-      <header className="flex items-center gap-4 px-5 py-3 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur shrink-0">
+      <header className="flex items-center gap-4 px-5 py-3 glass border-b-0 shrink-0 relative z-10">
         {/* Logo */}
         <div className="flex items-center gap-2 mr-2">
           <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center select-none">
@@ -102,13 +109,13 @@ export default function App() {
         </div>
 
         {/* Nav */}
-        <nav className="flex items-center gap-1 ml-2">
+        <nav className="flex items-center gap-1 ml-2 glass-subtle rounded-xl p-1">
           {(["library", "people", "settings"] as AppView[]).map((v) => (
             <button
               key={v}
               onClick={() => setView(v)}
-              className={`px-3 py-1.5 rounded-lg text-sm font-medium capitalize transition-colors
-                ${view === v ? "bg-zinc-800 text-zinc-100" : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900"}`}
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium capitalize transition-all duration-200
+                ${view === v ? "bg-white/10 text-zinc-100" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/5"}`}
             >
               {v}
             </button>
@@ -117,7 +124,7 @@ export default function App() {
 
         {/* Stats pill */}
         {stats && stats.total > 0 && (
-          <div className="hidden lg:flex items-center gap-1.5 text-xs text-zinc-500 bg-zinc-900 rounded-full px-3 py-1.5">
+          <div className="hidden lg:flex items-center gap-1.5 text-xs text-zinc-400 glass-subtle rounded-full px-3 py-1.5">
             <div
               className={`w-1.5 h-1.5 rounded-full ${authStatus.authenticated ? "bg-emerald-500" : "bg-zinc-600"}`}
             />
@@ -127,7 +134,7 @@ export default function App() {
       </header>
 
       {/* Main content */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 overflow-hidden relative z-10">
         <main className="flex-1 min-w-0 overflow-y-auto">
           {view === "settings" ? (
             <SettingsPage

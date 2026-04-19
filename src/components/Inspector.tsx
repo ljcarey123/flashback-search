@@ -92,7 +92,7 @@ export function Inspector({ photo, onClose, onZoom }: Props) {
     >
       <div
         style={{ width: panelWidth }}
-        className="h-full bg-zinc-900 border-l border-zinc-800 flex flex-col overflow-hidden relative"
+        className="h-full glass-strong border-l-0 flex flex-col overflow-hidden relative"
       >
         {/* Resize handle */}
         <div
@@ -105,7 +105,7 @@ export function Inspector({ photo, onClose, onZoom }: Props) {
         {photo ? (
           <>
             {/* Header */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 shrink-0 pl-5">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0 pl-5">
               <span className="text-sm font-medium text-zinc-300">Inspector</span>
               <button
                 onClick={onClose}
@@ -162,68 +162,61 @@ export function Inspector({ photo, onClose, onZoom }: Props) {
             </div>
 
             {/* Metadata */}
-            <div className="shrink-0 max-h-56 overflow-y-auto p-4 space-y-3 border-t border-zinc-800">
-              <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Filename</p>
-                <p className="text-sm text-zinc-200 break-all">{photo.filename}</p>
+            <div className="shrink-0 max-h-64 overflow-y-auto p-4 border-t border-white/10 space-y-3">
+              <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500">Information</p>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="glass-subtle rounded-xl p-3">
+                  <p className="text-xs text-zinc-500 mb-1">Date</p>
+                  <p className="text-sm text-zinc-200 leading-tight">{date}</p>
+                </div>
+
+                {photo.width && photo.height ? (
+                  <div className="glass-subtle rounded-xl p-3">
+                    <p className="text-xs text-zinc-500 mb-1">Dimensions</p>
+                    <p className="text-sm text-zinc-200 leading-tight">{photo.width} × {photo.height}</p>
+                  </div>
+                ) : photo.mime_type ? (
+                  <div className="glass-subtle rounded-xl p-3">
+                    <p className="text-xs text-zinc-500 mb-1">Type</p>
+                    <p className="text-sm text-zinc-200 leading-tight">{photo.mime_type}</p>
+                  </div>
+                ) : null}
               </div>
 
-              <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Date</p>
-                <p className="text-sm text-zinc-200">{date}</p>
+              <div className="glass-subtle rounded-xl p-3">
+                <p className="text-xs text-zinc-500 mb-1">Filename</p>
+                <p className="text-sm text-zinc-200 break-all leading-tight">{photo.filename}</p>
               </div>
-
-              {photo.width && photo.height && (
-                <div>
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Dimensions</p>
-                  <p className="text-sm text-zinc-200">
-                    {photo.width} × {photo.height}
-                  </p>
-                </div>
-              )}
-
-              {photo.mime_type && (
-                <div>
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Type</p>
-                  <p className="text-sm text-zinc-200">{photo.mime_type}</p>
-                </div>
-              )}
 
               {photo.description && (
-                <div>
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Description</p>
-                  <p className="text-sm text-zinc-300 italic">{photo.description}</p>
+                <div className="glass-subtle rounded-xl p-3">
+                  <p className="text-xs text-zinc-500 mb-1">Description</p>
+                  <p className="text-sm text-zinc-300 italic leading-snug">{photo.description}</p>
                 </div>
               )}
 
-              <div>
-                <p className="text-xs text-zinc-500 uppercase tracking-wider mb-1">Status</p>
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`w-2 h-2 rounded-full ${photo.indexed ? "bg-emerald-500" : "bg-zinc-600"}`}
-                  />
-                  <span className="text-sm text-zinc-300">
-                    {photo.indexed ? "Indexed" : "Not indexed"}
-                  </span>
-                </div>
+              <div className="flex items-center gap-2 px-1">
+                <div className={`w-2 h-2 rounded-full shrink-0 ${photo.indexed ? "bg-emerald-500" : "bg-zinc-600"}`} />
+                <span className="text-xs text-zinc-400">{photo.indexed ? "Indexed" : "Not indexed"}</span>
               </div>
 
               {savedPath && (
-                <div className="bg-emerald-900/30 border border-emerald-700/50 rounded-lg p-3">
+                <div className="bg-emerald-900/30 border border-emerald-700/50 rounded-xl p-3">
                   <p className="text-xs text-emerald-400">Saved to:</p>
                   <p className="text-xs text-emerald-300 break-all mt-0.5">{savedPath}</p>
                 </div>
               )}
 
               {error && (
-                <div className="bg-red-900/30 border border-red-700/50 rounded-lg p-3">
+                <div className="bg-red-900/30 border border-red-700/50 rounded-xl p-3">
                   <p className="text-xs text-red-400">{error}</p>
                 </div>
               )}
             </div>
 
             {/* Actions */}
-            <div className="p-4 border-t border-zinc-800 shrink-0">
+            <div className="p-4 border-t border-white/10 shrink-0">
               <button
                 onClick={download}
                 disabled={downloading || photo.is_video || !photo.local_path}

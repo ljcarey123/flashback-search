@@ -38,9 +38,8 @@ export function SearchBar({ onSearch, isSearching }: Props) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder='Search your memories… "me at the beach", "birthday cake 2023"'
-          className="w-full pl-12 pr-4 py-3.5 bg-zinc-800/80 backdrop-blur border border-zinc-700
-                     rounded-2xl text-zinc-100 placeholder-zinc-500 text-base
-                     focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20
+          className="w-full pl-12 pr-4 py-3.5 glass-subtle rounded-2xl text-zinc-100 placeholder-zinc-500 text-base
+                     focus:outline-none focus:ring-2 focus:ring-violet-500/40
                      transition-all"
         />
 

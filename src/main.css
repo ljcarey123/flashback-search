@@ -6,6 +6,31 @@
   --animate-fade-in: fade-in 0.2s ease both;
 }
 
+@layer utilities {
+  .glass {
+    background: oklch(0.2 0.02 260 / 0.45);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid oklch(0.5 0.02 260 / 0.2);
+    box-shadow: 0 8px 32px oklch(0 0 0 / 0.3);
+  }
+
+  .glass-subtle {
+    background: oklch(0.2 0.02 260 / 0.25);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid oklch(0.5 0.02 260 / 0.15);
+  }
+
+  .glass-strong {
+    background: oklch(0.15 0.02 260 / 0.85);
+    backdrop-filter: blur(32px);
+    -webkit-backdrop-filter: blur(32px);
+    border: 1px solid oklch(0.5 0.02 260 / 0.3);
+    box-shadow: 0 16px 48px oklch(0 0 0 / 0.4);
+  }
+}
+
 @keyframes photo-in {
   from {
     opacity: 0;
